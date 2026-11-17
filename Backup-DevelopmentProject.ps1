@@ -38,6 +38,67 @@ function Write-BackupLog {
     }
 }
 
+function Get-RobocopySummary {
+    <#
+    .SYNOPSIS
+        Reads the totals table at the end of Robocopy's output.
+    .DESCRIPTION
+        Robocopy (run with /BYTES) finishes with a table like this:
+
+                       Total    Copied   Skipped  Mismatch    FAILED    Extras
+            Dirs :        41         0        41         0         0         0
+           Files :        55         1        54         0         0         1
+           Bytes :     30910        68     30842         0         0        16
+
+        Returns a hashtable with a "Dirs", "Files", and "Bytes" entry, each
+        holding the six numbers. Returns $null if no table was found (for
+        example, Robocopy stopped with a fatal error before finishing).
+    #>
+    param(
+        # Every line Robocopy printed.
+        [string[]]$Output
+    )
+
+    $Summary = @{}
+
+    foreach ($Line in $Output) {
+        # A regular expression: a row name, a colon, then exactly six numbers.
+        # Each ( ) group is "captured" and can be read from $Matches afterwards.
+        if ($Line -match '^\s*(Dirs|Files|Bytes)\s*:\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$') {
+            $Summary[$Matches[1]] = [PSCustomObject]@{
+                Total    = [long]$Matches[2]
+                Copied   = [long]$Matches[3]
+                Skipped  = [long]$Matches[4]
+                Mismatch = [long]$Matches[5]
+                Failed   = [long]$Matches[6]
+                Extras   = [long]$Matches[7]
+            }
+        }
+    }
+
+    # Only trust the table if all three rows were found.
+    if ($Summary.Count -eq 3) {
+        return $Summary
+    }
+    return $null
+}
+
+function Format-ByteSize {
+    <#
+    .SYNOPSIS
+        Turns a byte count into readable text, such as "30.2 KB" or "1.45 GB".
+    #>
+    param(
+        [long]$Bytes
+    )
+
+    # 1KB, 1MB, and 1GB are built-in PowerShell numbers (1024, 1048576, ...).
+    if ($Bytes -ge 1GB) { return "{0:N2} GB" -f ($Bytes / 1GB) }
+    if ($Bytes -ge 1MB) { return "{0:N2} MB" -f ($Bytes / 1MB) }
+    if ($Bytes -ge 1KB) { return "{0:N1} KB" -f ($Bytes / 1KB) }
+    return "$Bytes bytes"
+}
+
 function Backup-DevelopmentProject {
     <#
     .SYNOPSIS
@@ -49,8 +110,10 @@ function Backup-DevelopmentProject {
         Every run (including dry runs) writes its own log file.
 
     .OUTPUTS
-        A PSCustomObject with Success, ExitCode, DryRun, Source, Destination,
-        LogFile, and Message, so calling scripts can check whether it worked.
+        A PSCustomObject with Success, ExitCode, DryRun, a summary (FilesCopied,
+        BytesCopied, FilesSkipped, FilesFailed, FilesExtra), the backup's size
+        (BackupFiles, BackupBytes), Duration, Source, Destination, LogFile,
+        and Message, so calling scripts can check what happened.
 
     .NOTES
         Author: Mr. Hardy
@@ -83,11 +146,21 @@ function Backup-DevelopmentProject {
     # This object is what the function hands back to whoever called it, so
     # another script can check $Result.Success instead of reading the console.
     # It starts out as a failure and is updated as the run progresses.
+    # The summary numbers stay $null if Robocopy never ran or gave no totals.
+    $StartTime = Get-Date
     $Result = [PSCustomObject]@{
-        Success     = $false
-        ExitCode    = $null      # Robocopy's exit code; stays $null if Robocopy never ran.
-        DryRun      = [bool]$DryRun
-        Source      = $Source
+        Success      = $false
+        ExitCode     = $null     # Robocopy's exit code; stays $null if Robocopy never ran.
+        DryRun       = [bool]$DryRun
+        FilesCopied  = $null     # Copied (or, in a dry run, would be copied).
+        BytesCopied  = $null     # Size of those files.
+        FilesSkipped = $null     # Not copied: unchanged, or excluded by a file pattern.
+        FilesFailed  = $null     # Could not be copied.
+        FilesExtra   = $null     # Exist only in the backup (left alone).
+        BackupFiles  = $null     # Files in the backup folder afterwards (not set for dry runs).
+        BackupBytes  = $null     # Storage the backup folder uses afterwards (not set for dry runs).
+        Duration     = $null     # How long the run took.
+        Source       = $Source
         Destination = $Destination
         LogFile     = $null
         Message     = ""
@@ -141,6 +214,7 @@ function Backup-DevelopmentProject {
     if (-not (Test-Path -LiteralPath $Source -PathType Container)) {
         $Result.Message = "Source directory does not exist."
         Write-BackupLog -LogFile $LogFile -Color Red -Message "ERROR: $($Result.Message)"
+        $Result.Duration = (Get-Date) - $StartTime
         return $Result
     }
 
@@ -162,6 +236,7 @@ function Backup-DevelopmentProject {
         catch {
             $Result.Message = "Could not create destination directory. $($_.Exception.Message)"
             Write-BackupLog -LogFile $LogFile -Color Red -Message "ERROR: $($Result.Message)"
+            $Result.Duration = (Get-Date) - $StartTime
             return $Result
         }
     }
@@ -207,7 +282,12 @@ function Backup-DevelopmentProject {
     Write-Host "Destination: $Destination`n"
 
     # Execute Robocopy.
-    # "| Out-Host" sends Robocopy's text straight to the console. Without it,
+    # /BYTES makes Robocopy print exact byte counts ("30910") instead of
+    # rounded sizes ("30.2 k"), so the totals can be read reliably.
+    #
+    # "Tee-Object -Variable" keeps a copy of every line in $RobocopyOutput
+    # (for the summary below) while passing each line along unchanged.
+    # "| Out-Host" then sends the lines straight to the console. Without it,
     # every line Robocopy prints would become part of this function's OUTPUT,
     # and a caller would receive dozens of text lines mixed in with $Result.
     robocopy $Source $Destination /E `
@@ -215,13 +295,61 @@ function Backup-DevelopmentProject {
         /XF $ExcludedFiles `
         /R:2 `
         /W:2 `
+        /BYTES `
         $DryRunOptions `
-        $LogOptions | Out-Host
+        $LogOptions | Tee-Object -Variable RobocopyOutput | Out-Host
 
     # Save the exit code right away; running other programs would replace it.
     $ExitCode = $LASTEXITCODE
     $Result.ExitCode = $ExitCode
     Write-BackupLog -LogFile $LogFile -LogOnly -Message "Robocopy exit code: $ExitCode"
+
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
+
+    # Note: Robocopy counts files excluded by a FILE pattern (*.user, ...)
+    # as "Skipped", but does not count anything inside an excluded FOLDER.
+    # That is why "Skipped" means "unchanged, or excluded by a file pattern".
+    $Summary = Get-RobocopySummary -Output $RobocopyOutput
+    if ($Summary) {
+        $Result.FilesCopied  = $Summary.Files.Copied
+        $Result.BytesCopied  = $Summary.Bytes.Copied
+        $Result.FilesSkipped = $Summary.Files.Skipped
+        $Result.FilesFailed  = $Summary.Files.Failed
+        $Result.FilesExtra   = $Summary.Files.Extras
+
+        if ($DryRun) { $Verb = "would be copied" } else { $Verb = "copied" }
+        $SummaryText = "Summary: {0} file(s) {1} ({2}), {3} skipped (unchanged or excluded by a file pattern), {4} failed, {5} only in backup." -f `
+            $Result.FilesCopied, $Verb, (Format-ByteSize $Result.BytesCopied),
+            $Result.FilesSkipped, $Result.FilesFailed, $Result.FilesExtra
+        Write-BackupLog -LogFile $LogFile -Message "`n$SummaryText"
+    }
+    else {
+        # Happens when Robocopy stops before printing its totals (a fatal
+        # error), or if Windows shows Robocopy's report in another language.
+        Write-BackupLog -LogFile $LogFile -Message "`nSummary: not available (Robocopy did not report totals)."
+    }
+
+    # Storage usage: measure the backup folder itself after a real run.
+    # -Force is needed to include HIDDEN items; without it the .git folder
+    # (hidden on Windows) would be left out of the count.
+    # Skipped for dry runs, because nothing was copied.
+    if (-not $DryRun -and (Test-Path -LiteralPath $Destination -PathType Container)) {
+        try {
+            $BackupContents = Get-ChildItem -LiteralPath $Destination -Recurse -File -Force -ErrorAction Stop |
+                Measure-Object -Property Length -Sum
+            $Result.BackupFiles = $BackupContents.Count
+            $Result.BackupBytes = [long]$BackupContents.Sum
+            Write-BackupLog -LogFile $LogFile -Message ("Backup size: {0} file(s), {1}." -f $Result.BackupFiles, (Format-ByteSize $Result.BackupBytes))
+        }
+        catch {
+            Write-BackupLog -LogFile $LogFile -Message "Backup size: could not be measured. $($_.Exception.Message)"
+        }
+    }
+
+    $Result.Duration = (Get-Date) - $StartTime
+    Write-BackupLog -LogFile $LogFile -Message ("Duration:    {0:N1} seconds." -f $Result.Duration.TotalSeconds)
 
     # Robocopy uses exit codes 0-7 for successful outcomes.
     # During a dry run the exit code describes what WOULD have happened.

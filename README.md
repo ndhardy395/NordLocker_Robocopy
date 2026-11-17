@@ -13,6 +13,7 @@ NordLocker does not read `.gitignore`, so this script decides what to leave out 
 - **Dry-run mode** — preview exactly what would be copied, without copying or creating anything.
 - **Per-run log files** — every run (backup, dry run, or failed run) is recorded with Robocopy's full report.
 - **Returns a result object** — scripts can check `.Success` instead of reading console text.
+- **Backup summaries** — files copied, skipped, and failed, how much data was copied, and how much storage the backup uses.
 
 ## Requirements
 
@@ -109,6 +110,14 @@ Every run returns one object. If you don't save it in a variable, PowerShell pri
 | `Success` | `$true` if the run worked (Robocopy exit code 0–7), otherwise `$false`. |
 | `ExitCode` | Robocopy's exit code. Empty if Robocopy never ran (for example, the source was missing). |
 | `DryRun` | `$true` if this was a dry run. |
+| `FilesCopied` | Files copied (in a dry run: files that *would* be copied). |
+| `BytesCopied` | Size of those files, in bytes. |
+| `FilesSkipped` | Files not copied because they were unchanged, **or** excluded by a file pattern (`*.user`, `*.suo`, `*.cache`). Files inside excluded folders aren't counted at all. |
+| `FilesFailed` | Files that could not be copied (for example, locked by another program). |
+| `FilesExtra` | Files that exist only in the backup and were left alone. |
+| `BackupFiles` | Number of files in the backup folder after the run, including `.git`. Empty for dry runs. |
+| `BackupBytes` | Storage the backup folder uses after the run, in bytes. Empty for dry runs. |
+| `Duration` | How long the run took. |
 | `Source` | The source path that was used. |
 | `Destination` | The destination path that was used. |
 | `LogFile` | Full path to this run's log file. Empty if logging failed. |
@@ -152,7 +161,17 @@ A log contains:
 
 1. A header with the time, mode, source, and destination
 2. Robocopy's full report: every new and changed file, the exclusions, and a totals table
-3. The Robocopy exit code and the final result
+3. The Robocopy exit code
+4. A summary, the backup's size, the duration, and the final result:
+
+```
+Summary: 39 file(s) copied (6.03 MB), 1 skipped (unchanged or excluded by a file pattern), 0 failed, 0 only in backup.
+Backup size: 39 file(s), 6.03 MB.
+Duration:    0.2 seconds.
+Backup completed successfully!
+```
+
+The summary lines are also shown in the console.
 
 Notes:
 
@@ -182,6 +201,8 @@ During a dry run, the code describes what *would* have happened.
 
 - Robocopy writes `100%` progress markers into the log file.
 - Old logs build up over time and need removing by hand.
+- The summary is read from Robocopy's English report. On a Windows installation where Robocopy reports in another language, the summary shows "not available" (the backup itself still works).
+- Measuring the backup's size means listing every file in it, which can take a while for very large backups.
 
 ## Roadmap
 
@@ -191,7 +212,7 @@ During a dry run, the code describes what *would* have happened.
 | Logging | ✅ Done |
 | Return a result object to the caller | ✅ Done |
 | Git discovery — find repositories automatically | Planned |
-| Backup summaries — copied files and storage used | Planned |
+| Backup summaries — copied files and storage used | ✅ Done |
 | Exclusion profiles for different environments | Planned |
 | Interactive project selection | Planned |
 | Integrity verification against the originals | Planned |
