@@ -1,15 +1,6 @@
-<#
-.SYNOPSIS
-    Backs up development projects while excluding unnecessary files.
-
-.DESCRIPTION
-    Uses Robocopy to copy development projects into a backup directory.
-    Preserves Git repositories while excluding generated build artifacts.
-    Every run (including dry runs) writes its own log file.
-
-.NOTES
-    Author: Mr. Hardy
-#>
+# Backup-DevelopmentProject.ps1
+# Dot-source this file to load the Backup-DevelopmentProject function:
+#     . .\Backup-DevelopmentProject.ps1
 
 function Write-BackupLog {
     <#
@@ -48,6 +39,21 @@ function Write-BackupLog {
 }
 
 function Backup-DevelopmentProject {
+    <#
+    .SYNOPSIS
+        Backs up development projects while excluding unnecessary files.
+
+    .DESCRIPTION
+        Uses Robocopy to copy development projects into a backup directory.
+        Preserves Git repositories while excluding generated build artifacts.
+        Every run (including dry runs) writes its own log file.
+
+    .NOTES
+        Author: Mr. Hardy
+    #>
+
+    # The help block above sits INSIDE the function so it always belongs to
+    # this function, no matter what other code is placed above it in the file.
 
     param(
         # Original development project location.
