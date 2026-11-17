@@ -5,10 +5,47 @@
 .DESCRIPTION
     Uses Robocopy to copy development projects into a backup directory.
     Preserves Git repositories while excluding generated build artifacts.
+    Every run (including dry runs) writes its own log file.
 
 .NOTES
     Author: Mr. Hardy
 #>
+
+function Write-BackupLog {
+    <#
+    .SYNOPSIS
+        Shows a message in the console and appends it to the log file.
+    #>
+    param(
+        # Text to record.
+        [string]$Message,
+
+        # Log file to append to. If empty, nothing is written to disk.
+        [string]$LogFile,
+
+        # Optional console color, for example "Red" or "Green".
+        [string]$Color,
+
+        # Write only to the log file, not to the console.
+        [switch]$LogOnly
+    )
+
+    if (-not $LogOnly) {
+        if ($Color) {
+            Write-Host $Message -ForegroundColor $Color
+        }
+        else {
+            Write-Host $Message
+        }
+    }
+
+    if ($LogFile) {
+        # Leading/trailing blank lines are for console spacing only,
+        # so they are trimmed before the timestamp is added.
+        $Time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        Add-Content -LiteralPath $LogFile -Value "[$Time] $($Message.Trim())"
+    }
+}
 
 function Backup-DevelopmentProject {
 
@@ -22,12 +59,59 @@ function Backup-DevelopmentProject {
         [string]$Destination,
 
         # Preview what would be copied without copying or creating anything.
-        [switch]$DryRun
+        [switch]$DryRun,
+
+        # Folder where a log file is written for every run.
+        # Defaults to a "Logs" folder next to this script.
+        [string]$LogDirectory = (Join-Path $PSScriptRoot "Logs")
     )
+
+    # ------------------------------------------------------------------
+    # Logging setup
+    # ------------------------------------------------------------------
+
+    # Each run gets its own log file, named after the project folder and
+    # the start time, for example: CalculatorApp_2026-11-17_15-50-23.log
+    $ProjectName = Split-Path -Path $Source.TrimEnd('\', '/') -Leaf
+    $LogName = "{0}_{1}" -f $ProjectName, (Get-Date -Format "yyyy-MM-dd_HH-mm-ss")
+    if ($DryRun) {
+        $LogName += "_DRYRUN"
+    }
+    $LogFile = Join-Path $LogDirectory "$LogName.log"
+
+    # A logging problem (bad folder, no permission) should not stop the
+    # backup itself, so failures here only produce a warning.
+    # -ErrorAction Stop turns errors into exceptions that "catch" can handle.
+    try {
+        if (-not (Test-Path -LiteralPath $LogDirectory)) {
+            New-Item -ItemType Directory -Path $LogDirectory -Force -ErrorAction Stop | Out-Null
+        }
+
+        # Create the log file now so any problem shows up before copying starts.
+        # If two runs start in the same second they share one file: the second
+        # run appends to it. No -Force here, so a log is never overwritten.
+        if (-not (Test-Path -LiteralPath $LogFile)) {
+            New-Item -ItemType File -Path $LogFile -ErrorAction Stop | Out-Null
+        }
+    }
+    catch {
+        Write-Warning "Could not create log file '$LogFile'. Continuing without logging. Reason: $($_.Exception.Message)"
+        $LogFile = $null
+    }
+
+    if ($DryRun) { $Mode = "DRY RUN" } else { $Mode = "BACKUP" }
+    Write-BackupLog -LogFile $LogFile -LogOnly -Message "Development backup started"
+    Write-BackupLog -LogFile $LogFile -LogOnly -Message "Mode:        $Mode"
+    Write-BackupLog -LogFile $LogFile -LogOnly -Message "Source:      $Source"
+    Write-BackupLog -LogFile $LogFile -LogOnly -Message "Destination: $Destination"
+
+    # ------------------------------------------------------------------
+    # Backup
+    # ------------------------------------------------------------------
 
     # Verify that the source directory exists.
     if (-not (Test-Path -LiteralPath $Source -PathType Container)) {
-        Write-Host "ERROR: Source directory does not exist." -ForegroundColor Red
+        Write-BackupLog -LogFile $LogFile -Color Red -Message "ERROR: Source directory does not exist."
         return
     }
 
@@ -67,6 +151,13 @@ function Backup-DevelopmentProject {
         Write-Host "`nStarting development backup..." -ForegroundColor Cyan
     }
 
+    # /LOG+:<file> appends Robocopy's full report to our log file.
+    # /TEE keeps showing that report in the console as well.
+    $LogOptions = @()
+    if ($LogFile) {
+        $LogOptions = @("/LOG+:$LogFile", "/TEE")
+    }
+
     Write-Host "Source:      $Source"
     Write-Host "Destination: $Destination`n"
 
@@ -76,19 +167,28 @@ function Backup-DevelopmentProject {
         /XF $ExcludedFiles `
         /R:2 `
         /W:2 `
-        $DryRunOptions
+        $DryRunOptions `
+        $LogOptions
+
+    # Save the exit code right away; running other programs would replace it.
+    $ExitCode = $LASTEXITCODE
+    Write-BackupLog -LogFile $LogFile -LogOnly -Message "Robocopy exit code: $ExitCode"
 
     # Robocopy uses exit codes 0-7 for successful outcomes.
     # During a dry run the exit code describes what WOULD have happened.
-    if ($LASTEXITCODE -lt 8) {
+    if ($ExitCode -lt 8) {
         if ($DryRun) {
-            Write-Host "`nDry run completed. No files were copied." -ForegroundColor Yellow
+            Write-BackupLog -LogFile $LogFile -Color Yellow -Message "`nDry run completed. No files were copied."
         }
         else {
-            Write-Host "`nBackup completed successfully!" -ForegroundColor Green
+            Write-BackupLog -LogFile $LogFile -Color Green -Message "`nBackup completed successfully!"
         }
     }
     else {
-        Write-Host "`nBackup encountered an error. Exit code: $LASTEXITCODE" -ForegroundColor Red
+        Write-BackupLog -LogFile $LogFile -Color Red -Message "`nBackup encountered an error. Exit code: $ExitCode"
+    }
+
+    if ($LogFile) {
+        Write-Host "Log file:    $LogFile"
     }
 }
