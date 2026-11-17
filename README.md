@@ -17,6 +17,7 @@ NordLocker does not read `.gitignore`, so this script decides what to leave out 
 - **Git discovery** — point it at a folder such as `source\repos` and it finds and backs up every Git repository inside, with an overview table at the end.
 - **Exclusion profiles** — built-in exclusion lists for Visual Studio, Unity, Unreal, CMake, and Godot projects, which can be combined.
 - **Git history that survives NordLocker** — each Git repository's full history is also saved as a single `.bundle` file, because NordLocker doesn't sync the `.git` folder (see [Git history and NordLocker](#git-history-and-nordlocker-bundles)).
+- **Integrity verification** — check a backup against the original at any time: missing, changed, and damaged files, plus the Git bundle and `.git` copy.
 
 ## Requirements
 
@@ -43,6 +44,8 @@ The functions stay available until you close that PowerShell window:
 | `Backup-DevelopmentProject` | Backs up one project folder. |
 | `Backup-GitRepository` | Finds every Git repository under a folder and backs up each one. |
 | `Find-GitRepository` | Lists the Git repositories under a folder (copies nothing). |
+| `Test-DevelopmentBackup` | Checks a backup against the original project (changes nothing). |
+| `Get-ExclusionProfile` | Lists the exclusion profiles. |
 
 > If PowerShell refuses to run the script because of its *execution policy*, see Microsoft's [about_Execution_Policies](https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_execution_policies) page.
 
@@ -230,12 +233,79 @@ git remote set-url origin https://github.com/<you>/SpaceGame.git
 
 Details:
 
-- The bundle is refreshed on every real backup and checked with `git bundle verify`. Dry runs don't create or change it.
+- The bundle is refreshed on every real backup and checked with a **test restore**: it's cloned into a temporary folder, checked with `git fsck`, and the temporary copy is deleted. (`git bundle verify` alone isn't enough, because it only reads the bundle's header. A bundle cut in half still passes it.) Dry runs don't create or change the bundle.
 - Git builds the new bundle in a temporary file first, so a failed run never damages the previous bundle.
 - If the bundle can't be created, the run reports `Success = $false`. The files were still copied, but the history wouldn't reach the cloud.
 - A bundle holds **committed** work only. Uncommitted changes are backed up as normal files, unless their names start with a dot.
 - Folders that aren't Git repositories get no bundle. Repositories with no commits yet are skipped, because Git can't bundle an empty history.
 - The bundle exists only in the backup, so Robocopy sees it as a backup-only file. The script leaves it out of the "only in backup" count.
+
+## Checking a backup (integrity verification)
+
+`Test-DevelopmentBackup` compares a backup with the original project and reports what it finds. It only **reads**: nothing in the original or the backup is changed.
+
+**Check one project:**
+
+```powershell
+Test-DevelopmentBackup -Source "C:\Projects\SpaceGame" -Destination "C:\NordLocker\Development_Backups\SpaceGame"
+```
+
+If the backup was made with a profile other than the default, pass the same `-ExclusionProfile`. Otherwise excluded files look "missing".
+
+**Check every backup you just made:** pipe the backup results straight in.
+
+```powershell
+$Results = Backup-GitRepository -SearchPath "C:\Users\<you>\source\repos" -DestinationRoot "C:\NordLocker\Development_Backups"
+$Results | Test-DevelopmentBackup
+```
+
+**Check existing backups later, without copying anything:** a dry run produces the same list of projects.
+
+```powershell
+Backup-GitRepository -SearchPath "C:\Users\<you>\source\repos" -DestinationRoot "C:\NordLocker\Development_Backups" -DryRun | Test-DevelopmentBackup
+```
+
+Example (from a real check of two NordLocker backups):
+
+```
+Project                    Status   FilesChecked FilesMissing FilesChanged FilesDamaged GitBundle GitCopy
+-------                    ------   ------------ ------------ ------------ ------------ --------- -------
+3D_Transformation_Pipeline OK                 50            0            0            0 OK        OK
+DevelopmentBackup          Outdated           80            0            2            0 OK        OK
+```
+
+### What is checked
+
+Every file that should be in the backup (the same exclusion rules as the backup) is compared with the original using a **SHA-256 hash**, a fingerprint of the file's content that changes completely if even one bit differs. Differences are sorted using the files' timestamps. Robocopy copies each file's "last modified" time exactly, so:
+
+| Group | Meaning |
+|---|---|
+| **Missing** | In the original but not in the backup (new since the last backup, or the copy failed). |
+| **Changed** | Content and timestamp both differ: the original was edited after the last backup. |
+| **Damaged** | Content differs but the timestamp is identical: the backup copy itself was altered or corrupted. |
+| **Only in backup** | Files that exist only in the backup. Informational, never a problem. |
+
+For Git repositories it also checks:
+
+- **Git bundle:** a real test restore succeeds, and the bundle contains every current branch and tag.
+- **Git copy (`.git`):** the backup's `.git` folder passes `git fsck`.
+
+### Status
+
+| Status | Meaning | What to do |
+|---|---|---|
+| `OK` | The backup matches the original exactly. | Nothing. |
+| `Outdated` | Nothing is damaged, but the original has changed since the last backup. | Run the backup again. |
+| `Damaged` | Part of the backup is corrupt. The log lists the affected files. | Delete the damaged files from the backup, then run the backup again. (Robocopy skips files whose size and date look unchanged, so it may not replace a damaged copy by itself.) |
+| `Error` | The check couldn't run, for example because a folder doesn't exist or a profile name is wrong. | Read the message. |
+
+Each run returns a result object (`Status`, `Success`, which is `$true` only for `OK`, the counts, the file lists `MissingFiles`/`ChangedFiles`/`DamagedFiles`/`ExtraFiles`, `GitBundle`, `GitCopy`, and `LogFile`) and writes a `..._VERIFY.log` file listing every affected file.
+
+Notes:
+
+- In a Git repository, any Git command (commit, fetch, …) updates files inside `.git`, so the backup shows as `Outdated` until the next backup. That's expected.
+- `-Quick` compares only file sizes and dates. It's much faster for large projects but **can't detect damaged files**.
+- Reading a file in the NordLocker folder that is stored only in the cloud makes NordLocker download it first. A full check of a large backup may download a lot of data.
 
 ## What gets excluded (exclusion profiles)
 
@@ -365,7 +435,7 @@ During a dry run, the code describes what *would* have happened.
 | Exclusion profiles for different environments | ✅ Done |
 | Interactive project selection | Planned |
 | Git history bundles (NordLocker doesn't sync `.git`) | ✅ Done |
-| Integrity verification against the originals | Planned |
+| Integrity verification against the originals | ✅ Done |
 | Multiple backup destinations | Planned |
 
 ## Author

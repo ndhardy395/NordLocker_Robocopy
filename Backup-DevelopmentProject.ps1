@@ -7,6 +7,7 @@
 #     Find-GitRepository          List the Git repositories under a folder.
 #     Backup-GitRepository        Find every Git repository under a folder and back each one up.
 #     Get-ExclusionProfile        List the exclusion profiles (VisualStudio, Unity, Unreal, ...).
+#     Test-DevelopmentBackup      Check a backup against the original project.
 
 function Write-BackupLog {
     <#
@@ -103,6 +104,43 @@ function Format-ByteSize {
     if ($Bytes -ge 1MB) { return "{0:N2} MB" -f ($Bytes / 1MB) }
     if ($Bytes -ge 1KB) { return "{0:N1} KB" -f ($Bytes / 1KB) }
     return "$Bytes bytes"
+}
+
+function Test-GitBundleFile {
+    <#
+    .SYNOPSIS
+        Checks that a Git bundle can really be restored. Returns $null if it
+        can, or a short reason if it can't.
+    .DESCRIPTION
+        "git bundle verify" only checks the bundle's header (its list of
+        branches), not the history data after it: a bundle cut in half still
+        passes. The reliable test is to actually restore it: clone it into
+        a temporary folder, check that copy with "git fsck", then delete it.
+    #>
+    param(
+        [string]$BundlePath
+    )
+
+    $TempClone = Join-Path ([System.IO.Path]::GetTempPath()) ("DevelopmentBackup-check-" + [guid]::NewGuid().ToString("N"))
+
+    # "finally" always runs, even after "return", so the temporary
+    # folder is removed whether the test passes or fails.
+    try {
+        $Output = git clone --bare --quiet $BundlePath $TempClone 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            return "a test restore failed ($(($Output | Select-Object -Last 1)))"
+        }
+        $Output = git -C $TempClone fsck --full 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            return "the restored history failed git fsck ($(($Output | Select-Object -Last 1)))"
+        }
+        return $null
+    }
+    finally {
+        if (Test-Path -LiteralPath $TempClone) {
+            Remove-Item -LiteralPath $TempClone -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Get-ExclusionProfile {
@@ -632,15 +670,15 @@ function Backup-DevelopmentProject {
                     $BundleProblem = "The Git history bundle could not be created: $(($BundleOutput | Select-Object -Last 1))"
                 }
                 else {
-                    # Check the new bundle is complete and readable.
-                    $VerifyOutput = git -C $Source bundle verify $BundlePath 2>&1
-                    if ($LASTEXITCODE -ne 0) {
-                        $BundleProblem = "The Git history bundle failed verification: $(($VerifyOutput | Select-Object -Last 1))"
+                    # Check the new bundle can really be restored.
+                    $BundleError = Test-GitBundleFile -BundlePath $BundlePath
+                    if ($BundleError) {
+                        $BundleProblem = "The Git history bundle is not usable: $BundleError"
                     }
                     else {
                         $Result.BundleFile = $BundlePath
                         $BundleSize = (Get-Item -LiteralPath $BundlePath).Length
-                        Write-BackupLog -LogFile $LogFile -Message ("Git bundle:  {0} ({1}, verified)" -f $BundlePath, (Format-ByteSize $BundleSize))
+                        Write-BackupLog -LogFile $LogFile -Message ("Git bundle:  {0} ({1}, test restore OK)" -f $BundlePath, (Format-ByteSize $BundleSize))
                     }
                 }
             }
@@ -843,4 +881,382 @@ function Backup-GitRepository {
     }
 
     return $Results
+}
+
+function Get-ExpectedBackupFile {
+    <#
+    .SYNOPSIS
+        Lists the files a backup of -Root should contain, as relative paths.
+    .DESCRIPTION
+        Applies the same exclusion rules as Backup-DevelopmentProject:
+        folder names at any depth, top-level-only folders, and file patterns.
+        Excluded folders are never entered, so huge cache folders (like
+        Unity's Library) don't slow the check down.
+    #>
+    param(
+        # Full path of the project folder.
+        [string]$Root,
+
+        # An object from Get-ExclusionProfile.
+        $Exclusions
+    )
+
+    $Root  = $Root.TrimEnd('\')
+    $Files = New-Object System.Collections.Generic.List[string]
+
+    # A QUEUE holds folders still to look inside. Each folder's subfolders
+    # are added to the back, until there is nothing left to visit.
+    $FoldersToVisit = New-Object System.Collections.Generic.Queue[string]
+    $FoldersToVisit.Enqueue($Root)
+
+    while ($FoldersToVisit.Count -gt 0) {
+        $Folder = $FoldersToVisit.Dequeue()
+        $IsTopLevel = ($Folder -eq $Root)
+
+        foreach ($Item in Get-ChildItem -LiteralPath $Folder -Force -ErrorAction SilentlyContinue) {
+            if ($Item.PSIsContainer) {
+                # -like understands the same * and ? wildcards as Robocopy;
+                # -contains compares whole names. Both ignore upper/lower case.
+                $ExcludedAnywhere = @($Exclusions.Directories | Where-Object { $Item.Name -like $_ }).Count -gt 0
+                $ExcludedAtTop    = $IsTopLevel -and ($Exclusions.RootDirectories -contains $Item.Name)
+                if (-not $ExcludedAnywhere -and -not $ExcludedAtTop) {
+                    $FoldersToVisit.Enqueue($Item.FullName)
+                }
+            }
+            else {
+                $ExcludedFile = @($Exclusions.Files | Where-Object { $Item.Name -like $_ }).Count -gt 0
+                if (-not $ExcludedFile) {
+                    $Files.Add($Item.FullName.Substring($Root.Length + 1))
+                }
+            }
+        }
+    }
+
+    return $Files
+}
+
+function Test-DevelopmentBackup {
+    <#
+    .SYNOPSIS
+        Checks a backup against the original project and reports any problems.
+
+    .DESCRIPTION
+        Compares every file that should be in the backup with the original,
+        using a SHA-256 hash (a fingerprint of the file's content), and
+        checks the Git history bundle and the backup's .git folder.
+
+        Each difference is sorted into one of these groups:
+          Missing   In the original but not in the backup.
+          Changed   Content differs AND the original's timestamp differs:
+                    the original was edited after the last backup.
+          Damaged   Content differs but the timestamps are identical:
+                    the backup copy itself has been altered or corrupted.
+          Extra     Only in the backup (informational; never a problem).
+
+        The overall Status is:
+          OK        The backup matches the original exactly.
+          Outdated  Nothing is damaged, but the original has changed since
+                    the last backup. Run the backup again.
+          Damaged   Some of the backup is corrupt. See the log for details.
+          Error     The check could not run (for example, a folder is missing).
+
+        Nothing is ever changed: this command only reads.
+
+    .OUTPUTS
+        One result object per backup checked, with Status, Success (true only
+        for OK), the counts and file lists for each group, GitBundle, GitCopy,
+        Method, Duration, Source, Destination, LogFile, and Message.
+
+    .EXAMPLE
+        Test-DevelopmentBackup -Source "C:\Projects\SpaceGame" -Destination "C:\NordLocker\Development_Backups\SpaceGame"
+
+    .EXAMPLE
+        $Results = Backup-GitRepository -SearchPath "C:\Users\Me\source\repos" -DestinationRoot "C:\NordLocker\Development_Backups"
+        $Results | Test-DevelopmentBackup
+        Checks every backup that was just made.
+    #>
+
+    # [CmdletBinding()] turns on advanced-function features. Here it lets the
+    # Source/Destination/ExclusionProfile values arrive through the pipeline
+    # ( | ) straight from the result objects of the backup commands.
+    [CmdletBinding()]
+    param(
+        # Original project folder.
+        [Parameter(Mandatory = $true, ValueFromPipelineByPropertyName = $true)]
+        [string]$Source,
+
+        # Backup folder to check.
+        [Parameter(Mandatory = $true, ValueFromPipelineByPropertyName = $true)]
+        [string]$Destination,
+
+        # The exclusion profile(s) the backup was made with.
+        [Parameter(ValueFromPipelineByPropertyName = $true)]
+        [string[]]$ExclusionProfile = @("VisualStudio"),
+
+        # Compare only file sizes and dates instead of full content hashes.
+        # Much faster for big projects, but cannot detect damaged files.
+        [switch]$Quick,
+
+        # Folder where the verification log is written.
+        [string]$LogDirectory = (Get-DefaultLogDirectory)
+    )
+
+    # A pipeline function has three parts:
+    #   begin   runs once, before the first item arrives
+    #   process runs once for EACH item (or once, when called normally)
+    #   end     runs once, after the last item
+    begin {
+        $AllResults = New-Object System.Collections.Generic.List[object]
+        # How many file names to list per group in the console (all go to the log).
+        $ConsoleListLimit = 10
+    }
+
+    process {
+        $StartTime = Get-Date
+
+        # Result objects store several profiles as one string ("Unity, VisualStudio").
+        $ProfileNames = @($ExclusionProfile -split '\s*,\s*' | Where-Object { $_ })
+
+        $Result = [PSCustomObject]@{
+            Status       = "Error"
+            Success      = $false
+            FilesChecked = 0
+            FilesMissing = 0
+            FilesChanged = 0
+            FilesDamaged = 0
+            FilesExtra   = 0
+            GitBundle    = "-"       # OK, Outdated, Missing, Invalid, No commits, Not checked, or "-"
+            GitCopy      = "-"       # OK, Damaged, Missing, Not checked, or "-"
+            Method       = $(if ($Quick) { "Size and date" } else { "SHA-256" })
+            Duration     = $null
+            MissingFiles = @()
+            ChangedFiles = @()
+            DamagedFiles = @()
+            ExtraFiles   = @()
+            Source       = $Source
+            Destination  = $Destination
+            LogFile      = $null
+            Message      = ""
+        }
+
+        # --- Log file (same rules as backups; a problem here is only a warning) ---
+        $ProjectName = Split-Path -Path $Source.TrimEnd('\', '/') -Leaf
+        $LogFile = Join-Path $LogDirectory ("{0}_{1}_VERIFY.log" -f $ProjectName, (Get-Date -Format "yyyy-MM-dd_HH-mm-ss"))
+        try {
+            if (-not (Test-Path -LiteralPath $LogDirectory)) {
+                New-Item -ItemType Directory -Path $LogDirectory -Force -ErrorAction Stop | Out-Null
+            }
+            if (-not (Test-Path -LiteralPath $LogFile)) {
+                New-Item -ItemType File -Path $LogFile -ErrorAction Stop | Out-Null
+            }
+        }
+        catch {
+            Write-Warning "Could not create log file '$LogFile'. Continuing without logging. Reason: $($_.Exception.Message)"
+            $LogFile = $null
+        }
+        $Result.LogFile = $LogFile
+
+        Write-Host "`nVerifying backup of $ProjectName ..." -ForegroundColor Cyan
+        Write-BackupLog -LogFile $LogFile -LogOnly -Message "Backup verification started"
+        Write-BackupLog -LogFile $LogFile -LogOnly -Message "Source:      $Source"
+        Write-BackupLog -LogFile $LogFile -LogOnly -Message "Destination: $Destination"
+        Write-BackupLog -LogFile $LogFile -LogOnly -Message "Exclusions:  $($ProfileNames -join ', ')"
+        Write-BackupLog -LogFile $LogFile -LogOnly -Message "Method:      $($Result.Method)"
+
+        # --- Can the check run at all? ---
+        $Problem = $null
+        if (-not (Test-Path -LiteralPath $Source -PathType Container)) {
+            $Problem = "The original project folder does not exist."
+        }
+        elseif (-not (Test-Path -LiteralPath $Destination -PathType Container)) {
+            $Problem = "The backup folder does not exist. Has this project been backed up yet?"
+        }
+        else {
+            try {
+                $Exclusions = Get-ExclusionProfile -Name $ProfileNames
+            }
+            catch {
+                $Problem = $_.Exception.Message
+            }
+        }
+        if ($Problem) {
+            $Result.Message  = $Problem
+            $Result.Duration = (Get-Date) - $StartTime
+            Write-BackupLog -LogFile $LogFile -Color Red -Message "ERROR: $Problem"
+            $AllResults.Add($Result)
+            return $Result
+        }
+
+        $FullSource      = (Get-FullPath $Source).TrimEnd('\')
+        $FullDestination = (Get-FullPath $Destination).TrimEnd('\')
+        $BundleName      = "$ProjectName.bundle"
+
+        # --- Compare files ---
+        $Expected = Get-ExpectedBackupFile -Root $FullSource -Exclusions $Exclusions
+        $Missing = New-Object System.Collections.Generic.List[string]
+        $Changed = New-Object System.Collections.Generic.List[string]
+        $Damaged = New-Object System.Collections.Generic.List[string]
+
+        foreach ($RelativePath in $Expected) {
+            $Original = Get-Item -LiteralPath (Join-Path $FullSource $RelativePath) -Force
+            $CopyPath = Join-Path $FullDestination $RelativePath
+
+            if (-not (Test-Path -LiteralPath $CopyPath -PathType Leaf)) {
+                $Missing.Add($RelativePath)
+                continue
+            }
+            $Copy = Get-Item -LiteralPath $CopyPath -Force
+            $SameTimestamp = ($Original.LastWriteTimeUtc -eq $Copy.LastWriteTimeUtc)
+
+            if ($Quick) {
+                # Without reading the content, a difference can only mean "changed".
+                if (-not $SameTimestamp -or $Original.Length -ne $Copy.Length) {
+                    $Changed.Add($RelativePath)
+                }
+            }
+            else {
+                # Get-FileHash reads the whole file and computes a SHA-256
+                # fingerprint. Any change to the content, even one bit,
+                # gives a completely different fingerprint.
+                $OriginalHash = (Get-FileHash -LiteralPath $Original.FullName -Algorithm SHA256).Hash
+                $CopyHash     = (Get-FileHash -LiteralPath $Copy.FullName -Algorithm SHA256).Hash
+                if ($OriginalHash -ne $CopyHash) {
+                    if ($SameTimestamp) { $Damaged.Add($RelativePath) } else { $Changed.Add($RelativePath) }
+                }
+            }
+        }
+
+        # Files only in the backup. The Git bundle belongs there, so it doesn't count.
+        $ExpectedSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($RelativePath in $Expected) { [void]$ExpectedSet.Add($RelativePath) }
+        $Extra = @(Get-ChildItem -LiteralPath $FullDestination -Recurse -File -Force -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.FullName.Substring($FullDestination.Length + 1) } |
+            Where-Object { -not $ExpectedSet.Contains($_) -and $_ -ne $BundleName })
+
+        $Result.FilesChecked = $Expected.Count
+        $Result.FilesMissing = $Missing.Count
+        $Result.FilesChanged = $Changed.Count
+        $Result.FilesDamaged = $Damaged.Count
+        $Result.FilesExtra   = $Extra.Count
+        $Result.MissingFiles = @($Missing)
+        $Result.ChangedFiles = @($Changed)
+        $Result.DamagedFiles = @($Damaged)
+        $Result.ExtraFiles   = $Extra
+
+        # --- Git checks (only for Git repositories) ---
+        if (Test-Path -LiteralPath (Join-Path $FullSource ".git")) {
+            if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+                $Result.GitBundle = "Not checked"
+                $Result.GitCopy   = "Not checked"
+                Write-BackupLog -LogFile $LogFile -Color Yellow -Message "Git is not installed, so the Git checks were skipped."
+            }
+            else {
+                # 1. The bundle: valid, and holding every current branch and tag?
+                $BundlePath = Join-Path $FullDestination $BundleName
+                $SourceRefs = @(git -C $FullSource for-each-ref --format="%(objectname) %(refname)" refs/heads refs/tags)
+                if ($SourceRefs.Count -eq 0) {
+                    $Result.GitBundle = "No commits"
+                }
+                elseif (-not (Test-Path -LiteralPath $BundlePath -PathType Leaf)) {
+                    $Result.GitBundle = "Missing"
+                }
+                else {
+                    $BundleError = Test-GitBundleFile -BundlePath $BundlePath
+                    if ($BundleError) {
+                        $Result.GitBundle = "Invalid"
+                        Write-BackupLog -LogFile $LogFile -LogOnly -Message "Git bundle problem: $BundleError"
+                    }
+                    else {
+                        $BundleRefs = @(git -C $FullSource bundle list-heads $BundlePath)
+                        $NotInBundle = @($SourceRefs | Where-Object { $BundleRefs -notcontains $_ })
+                        if ($NotInBundle.Count -gt 0) {
+                            $Result.GitBundle = "Outdated"
+                            foreach ($Ref in $NotInBundle) {
+                                Write-BackupLog -LogFile $LogFile -LogOnly -Message "Newer than the bundle: $($Ref.Split(' ')[1])"
+                            }
+                        }
+                        else {
+                            $Result.GitBundle = "OK"
+                        }
+                    }
+                }
+
+                # 2. The backup's own .git copy: is it a consistent repository?
+                if (Test-Path -LiteralPath (Join-Path $FullDestination ".git")) {
+                    # fsck ("file system check") only reads; it never changes the repository.
+                    git -C $FullDestination fsck --full 2>&1 | Out-Null
+                    if ($LASTEXITCODE -eq 0) { $Result.GitCopy = "OK" } else { $Result.GitCopy = "Damaged" }
+                }
+                else {
+                    $Result.GitCopy = "Missing"
+                }
+            }
+        }
+
+        # --- Overall status ---
+        if ($Result.FilesDamaged -gt 0 -or $Result.GitBundle -eq "Invalid" -or $Result.GitCopy -eq "Damaged") {
+            $Result.Status  = "Damaged"
+            $Result.Message = "Part of the backup is damaged. See the log for the affected files."
+            $Color = "Red"
+        }
+        elseif ($Result.FilesMissing -gt 0 -or $Result.FilesChanged -gt 0 -or
+                $Result.GitBundle -in @("Missing", "Outdated") -or $Result.GitCopy -eq "Missing") {
+            $Result.Status  = "Outdated"
+            $Result.Message = "Nothing is damaged, but the original has changed since the last backup. Run the backup again."
+            $Color = "Yellow"
+        }
+        else {
+            $Result.Status  = "OK"
+            $Result.Success = $true
+            $Result.Message = "The backup matches the original."
+            $Color = "Green"
+        }
+        $Result.Duration = (Get-Date) - $StartTime
+
+        # --- Report ---
+        Write-BackupLog -LogFile $LogFile -Message ("  Files checked:      {0} ({1})" -f $Result.FilesChecked, $Result.Method)
+        Write-BackupLog -LogFile $LogFile -Message ("  Missing:            {0}" -f $Result.FilesMissing)
+        Write-BackupLog -LogFile $LogFile -Message ("  Changed since backup: {0}" -f $Result.FilesChanged)
+        Write-BackupLog -LogFile $LogFile -Message ("  Damaged:            {0}" -f $Result.FilesDamaged)
+        Write-BackupLog -LogFile $LogFile -Message ("  Only in backup:     {0}" -f $Result.FilesExtra)
+        if ($Result.GitBundle -ne "-") {
+            Write-BackupLog -LogFile $LogFile -Message ("  Git bundle:         {0}" -f $Result.GitBundle)
+            Write-BackupLog -LogFile $LogFile -Message ("  Git copy (.git):    {0}" -f $Result.GitCopy)
+        }
+
+        # List the affected files: a few in the console, all of them in the log.
+        foreach ($Group in @(
+            @{ Label = "Damaged";              Files = $Result.DamagedFiles; Color = "Red" },
+            @{ Label = "Missing";              Files = $Result.MissingFiles; Color = "Yellow" },
+            @{ Label = "Changed since backup"; Files = $Result.ChangedFiles; Color = "Yellow" },
+            @{ Label = "Only in backup";       Files = $Result.ExtraFiles;   Color = "Gray" })) {
+            if ($Group.Files.Count -eq 0) { continue }
+            Write-Host "  $($Group.Label):" -ForegroundColor $Group.Color
+            $Group.Files | Select-Object -First $ConsoleListLimit | ForEach-Object { Write-Host "    $_" }
+            if ($Group.Files.Count -gt $ConsoleListLimit) {
+                Write-Host "    ... and $($Group.Files.Count - $ConsoleListLimit) more (see the log)"
+            }
+            foreach ($File in $Group.Files) {
+                Write-BackupLog -LogFile $LogFile -LogOnly -Message "$($Group.Label): $File"
+            }
+        }
+
+        Write-BackupLog -LogFile $LogFile -Color $Color -Message "Result: $($Result.Status). $($Result.Message)"
+        if ($LogFile) {
+            Write-Host "Log file: $LogFile"
+        }
+
+        $AllResults.Add($Result)
+        return $Result
+    }
+
+    end {
+        # When several backups were checked, finish with an overview table.
+        if ($AllResults.Count -gt 1) {
+            Write-Host "`n===== Backup verification overview =====" -ForegroundColor Cyan
+            $AllResults | Format-Table -AutoSize `
+                @{ Label = "Project"; Expression = { Split-Path $_.Source.TrimEnd('\') -Leaf } },
+                Status, FilesChecked, FilesMissing, FilesChanged, FilesDamaged, GitBundle, GitCopy | Out-Host
+        }
+    }
 }
