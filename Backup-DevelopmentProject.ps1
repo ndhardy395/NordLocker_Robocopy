@@ -48,6 +48,10 @@ function Backup-DevelopmentProject {
         Preserves Git repositories while excluding generated build artifacts.
         Every run (including dry runs) writes its own log file.
 
+    .OUTPUTS
+        A PSCustomObject with Success, ExitCode, DryRun, Source, Destination,
+        LogFile, and Message, so calling scripts can check whether it worked.
+
     .NOTES
         Author: Mr. Hardy
     #>
@@ -71,6 +75,23 @@ function Backup-DevelopmentProject {
         # Defaults to a "Logs" folder next to this script.
         [string]$LogDirectory = (Join-Path $PSScriptRoot "Logs")
     )
+
+    # ------------------------------------------------------------------
+    # Result object
+    # ------------------------------------------------------------------
+
+    # This object is what the function hands back to whoever called it, so
+    # another script can check $Result.Success instead of reading the console.
+    # It starts out as a failure and is updated as the run progresses.
+    $Result = [PSCustomObject]@{
+        Success     = $false
+        ExitCode    = $null      # Robocopy's exit code; stays $null if Robocopy never ran.
+        DryRun      = [bool]$DryRun
+        Source      = $Source
+        Destination = $Destination
+        LogFile     = $null
+        Message     = ""
+    }
 
     # ------------------------------------------------------------------
     # Logging setup
@@ -104,6 +125,7 @@ function Backup-DevelopmentProject {
         Write-Warning "Could not create log file '$LogFile'. Continuing without logging. Reason: $($_.Exception.Message)"
         $LogFile = $null
     }
+    $Result.LogFile = $LogFile
 
     if ($DryRun) { $Mode = "DRY RUN" } else { $Mode = "BACKUP" }
     Write-BackupLog -LogFile $LogFile -LogOnly -Message "Development backup started"
@@ -117,14 +139,31 @@ function Backup-DevelopmentProject {
 
     # Verify that the source directory exists.
     if (-not (Test-Path -LiteralPath $Source -PathType Container)) {
-        Write-BackupLog -LogFile $LogFile -Color Red -Message "ERROR: Source directory does not exist."
-        return
+        $Result.Message = "Source directory does not exist."
+        Write-BackupLog -LogFile $LogFile -Color Red -Message "ERROR: $($Result.Message)"
+        return $Result
     }
 
     # Create destination directory if necessary.
     # Skipped during a dry run so that a preview never changes the disk.
+    # If the folder can't be created (bad drive letter, no permission),
+    # stop here with a clear message instead of letting Robocopy fail.
     if (-not $DryRun -and -not (Test-Path -LiteralPath $Destination)) {
-        New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+        try {
+            New-Item -ItemType Directory -Path $Destination -Force -ErrorAction Stop | Out-Null
+
+            # New-Item -Force can silently do nothing (for example when part of
+            # the path is a file), so confirm the folder really exists.
+            # "throw" raises our own error, which jumps to the catch block below.
+            if (-not (Test-Path -LiteralPath $Destination -PathType Container)) {
+                throw "The folder was not created. Check that no part of the path is a file."
+            }
+        }
+        catch {
+            $Result.Message = "Could not create destination directory. $($_.Exception.Message)"
+            Write-BackupLog -LogFile $LogFile -Color Red -Message "ERROR: $($Result.Message)"
+            return $Result
+        }
     }
 
     # Directories that should not be included.
@@ -168,33 +207,43 @@ function Backup-DevelopmentProject {
     Write-Host "Destination: $Destination`n"
 
     # Execute Robocopy.
+    # "| Out-Host" sends Robocopy's text straight to the console. Without it,
+    # every line Robocopy prints would become part of this function's OUTPUT,
+    # and a caller would receive dozens of text lines mixed in with $Result.
     robocopy $Source $Destination /E `
         /XD $ExcludedDirectories `
         /XF $ExcludedFiles `
         /R:2 `
         /W:2 `
         $DryRunOptions `
-        $LogOptions
+        $LogOptions | Out-Host
 
     # Save the exit code right away; running other programs would replace it.
     $ExitCode = $LASTEXITCODE
+    $Result.ExitCode = $ExitCode
     Write-BackupLog -LogFile $LogFile -LogOnly -Message "Robocopy exit code: $ExitCode"
 
     # Robocopy uses exit codes 0-7 for successful outcomes.
     # During a dry run the exit code describes what WOULD have happened.
     if ($ExitCode -lt 8) {
+        $Result.Success = $true
         if ($DryRun) {
-            Write-BackupLog -LogFile $LogFile -Color Yellow -Message "`nDry run completed. No files were copied."
+            $Result.Message = "Dry run completed. No files were copied."
+            Write-BackupLog -LogFile $LogFile -Color Yellow -Message "`n$($Result.Message)"
         }
         else {
-            Write-BackupLog -LogFile $LogFile -Color Green -Message "`nBackup completed successfully!"
+            $Result.Message = "Backup completed successfully!"
+            Write-BackupLog -LogFile $LogFile -Color Green -Message "`n$($Result.Message)"
         }
     }
     else {
-        Write-BackupLog -LogFile $LogFile -Color Red -Message "`nBackup encountered an error. Exit code: $ExitCode"
+        $Result.Message = "Backup encountered an error. Exit code: $ExitCode"
+        Write-BackupLog -LogFile $LogFile -Color Red -Message "`n$($Result.Message)"
     }
 
     if ($LogFile) {
         Write-Host "Log file:    $LogFile"
     }
+
+    return $Result
 }

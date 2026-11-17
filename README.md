@@ -12,6 +12,7 @@ NordLocker does not read `.gitignore`, so this script decides what to leave out 
 - **Never touches the original project** — the source folder is only read.
 - **Dry-run mode** — preview exactly what would be copied, without copying or creating anything.
 - **Per-run log files** — every run (backup, dry run, or failed run) is recorded with Robocopy's full report.
+- **Returns a result object** — scripts can check `.Success` instead of reading console text.
 
 ## Requirements
 
@@ -61,6 +62,29 @@ Backup-DevelopmentProject `
     -LogDirectory "D:\BackupLogs"
 ```
 
+**Check the result from a script:**
+
+```powershell
+$Result = Backup-DevelopmentProject -Source "C:\Projects\CalculatorApp" -Destination "C:\NordLocker\Development_Backups\CalculatorApp"
+
+if (-not $Result.Success) {
+    Write-Warning "Backup failed: $($Result.Message) (see $($Result.LogFile))"
+}
+```
+
+**Back up several projects and list any failures:**
+
+```powershell
+$Projects = "C:\Projects\CalculatorApp", "C:\Projects\SpaceGame"
+
+$Results = foreach ($Project in $Projects) {
+    $Name = Split-Path $Project -Leaf
+    Backup-DevelopmentProject -Source $Project -Destination "C:\NordLocker\Development_Backups\$Name"
+}
+
+$Results | Where-Object { -not $_.Success } | Format-Table Source, ExitCode, Message
+```
+
 **Built-in help:**
 
 ```powershell
@@ -75,6 +99,25 @@ Get-Help Backup-DevelopmentProject -Full
 | `-Destination` | Yes | Where the backup goes. Created automatically if it doesn't exist (except during a dry run). |
 | `-DryRun` | No | Lists what would be copied without copying, overwriting, or creating anything. Uses Robocopy's `/L` (list only) switch. |
 | `-LogDirectory` | No | Folder for log files. Defaults to a `Logs` folder next to the script. |
+
+### Result object
+
+Every run returns one object. If you don't save it in a variable, PowerShell prints it at the end as a summary. To hide it, use `$null = Backup-DevelopmentProject ...`.
+
+| Property | Description |
+|---|---|
+| `Success` | `$true` if the run worked (Robocopy exit code 0–7), otherwise `$false`. |
+| `ExitCode` | Robocopy's exit code. Empty if Robocopy never ran (for example, the source was missing). |
+| `DryRun` | `$true` if this was a dry run. |
+| `Source` | The source path that was used. |
+| `Destination` | The destination path that was used. |
+| `LogFile` | Full path to this run's log file. Empty if logging failed. |
+| `Message` | A short description of what happened. |
+
+The run stops early, with `Success = $false`, if:
+
+- the source folder doesn't exist, or
+- the destination folder can't be created (for example, a missing drive, or part of the path is a file).
 
 ## What gets excluded
 
@@ -137,7 +180,6 @@ During a dry run, the code describes what *would* have happened.
 
 ## Known limitations
 
-- The function reports its result as console text only, so another script can't easily tell whether a backup succeeded.
 - Robocopy writes `100%` progress markers into the log file.
 - Old logs build up over time and need removing by hand.
 
@@ -147,7 +189,7 @@ During a dry run, the code describes what *would* have happened.
 |---|---|
 | Dry-run mode | ✅ Done |
 | Logging | ✅ Done |
-| Return a result object to the caller | Planned |
+| Return a result object to the caller | ✅ Done |
 | Git discovery — find repositories automatically | Planned |
 | Backup summaries — copied files and storage used | Planned |
 | Exclusion profiles for different environments | Planned |
