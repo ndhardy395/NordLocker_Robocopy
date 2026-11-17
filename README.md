@@ -14,6 +14,7 @@ NordLocker does not read `.gitignore`, so this script decides what to leave out 
 - **Per-run log files** — every run (backup, dry run, or failed run) is recorded with Robocopy's full report.
 - **Returns a result object** — scripts can check `.Success` instead of reading console text.
 - **Backup summaries** — files copied, skipped, and failed, how much data was copied, and how much storage the backup uses.
+- **Git discovery** — point it at a folder such as `source\repos` and it finds and backs up every Git repository inside, with an overview table at the end.
 
 ## Requirements
 
@@ -31,7 +32,13 @@ cd C:\Users\<you>\source\repos\DevelopmentBackup
 . .\Backup-DevelopmentProject.ps1
 ```
 
-The function stays available until you close that PowerShell window.
+The functions stay available until you close that PowerShell window:
+
+| Command | What it does |
+|---|---|
+| `Backup-DevelopmentProject` | Backs up one project folder. |
+| `Backup-GitRepository` | Finds every Git repository under a folder and backs up each one. |
+| `Find-GitRepository` | Lists the Git repositories under a folder (copies nothing). |
 
 > If PowerShell refuses to run the script because of its *execution policy*, see Microsoft's [about_Execution_Policies](https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_execution_policies) page.
 
@@ -90,6 +97,7 @@ $Results | Where-Object { -not $_.Success } | Format-Table Source, ExitCode, Mes
 
 ```powershell
 Get-Help Backup-DevelopmentProject -Full
+Get-Help Backup-GitRepository -Full
 ```
 
 ### Parameters
@@ -125,8 +133,67 @@ Every run returns one object. If you don't save it in a variable, PowerShell pri
 
 The run stops early, with `Success = $false`, if:
 
-- the source folder doesn't exist, or
+- the source folder doesn't exist,
+- the destination is the source itself or inside it (Robocopy would otherwise copy the backup into itself), or
 - the destination folder can't be created (for example, a missing drive, or part of the path is a file).
+
+## Backing up all Git repositories at once
+
+**See which repositories would be backed up:**
+
+```powershell
+Find-GitRepository -Path "C:\Users\<you>\source\repos"
+```
+
+**Preview, then back up all of them:**
+
+```powershell
+$Results = Backup-GitRepository `
+    -SearchPath "C:\Users\<you>\source\repos" `
+    -DestinationRoot "C:\NordLocker\Development_Backups" `
+    -DryRun
+
+$Results = Backup-GitRepository `
+    -SearchPath "C:\Users\<you>\source\repos" `
+    -DestinationRoot "C:\NordLocker\Development_Backups"
+```
+
+Each repository keeps its place in the folder layout, so repositories with the same name in different folders never collide:
+
+```
+C:\Users\<you>\source\repos\Games\SpaceGame   ->  C:\NordLocker\Development_Backups\Games\SpaceGame
+C:\Users\<you>\source\repos\Tools\Calc        ->  C:\NordLocker\Development_Backups\Tools\Calc
+```
+
+At the end you get an overview table:
+
+```
+Repository                 Success Copied        FilesFailed Backup size Message
+----------                 ------- ------        ----------- ----------- -------
+3D_Transformation_Pipeline    True 50 (139.6 KB)           0 139.6 KB    Backup completed successfully!
+DevelopmentBackup             True 67 (103.3 KB)           0 112.2 KB    Backup completed successfully!
+2 of 2 repository(s) succeeded. 117 file(s) copied (242.8 KB).
+Backups now use 251.8 KB in total.
+```
+
+`$Results` holds one [result object](#result-object) per repository. Save the output in a variable as shown; otherwise PowerShell also prints every result object in full after the table.
+
+| Parameter | Required | Description |
+|---|---|---|
+| `-SearchPath` | Yes | Folder to search for Git repositories. |
+| `-DestinationRoot` | Yes | Folder that receives one backup folder per repository. |
+| `-MaxDepth` | No | How many folder levels below `-SearchPath` to search. Default: `4`. |
+| `-DryRun` | No | Preview every repository without copying anything. |
+| `-LogDirectory` | No | Where each repository's log file goes. Defaults to `Logs` next to the script. |
+
+How repositories are found:
+
+- A folder is a repository if it contains `.git`.
+- The search doesn't look inside a repository once it finds one. A repository nested inside another is backed up as part of the outer one.
+- Folders that are links or junctions are skipped, so the search can't loop forever.
+- Repositories inside `-DestinationRoot` are ignored, so earlier backups are never backed up again.
+- Folders without `.git` are **not** backed up. Use `Backup-DevelopmentProject` for those.
+- One repository failing doesn't stop the others.
 
 ## What gets excluded
 
@@ -203,6 +270,8 @@ During a dry run, the code describes what *would* have happened.
 - Old logs build up over time and need removing by hand.
 - The summary is read from Robocopy's English report. On a Windows installation where Robocopy reports in another language, the summary shows "not available" (the backup itself still works).
 - Measuring the backup's size means listing every file in it, which can take a while for very large backups.
+- The default `Logs` folder is inside this project. If you back up this project itself (for example with `Backup-GitRepository` on `source\repos`), its log files are copied too. Use `-LogDirectory` to keep logs elsewhere.
+- A Git *worktree* (a folder whose `.git` is a file, not a folder) is found and backed up, but its history lives in the main repository, so back that up as well.
 
 ## Roadmap
 
@@ -211,7 +280,7 @@ During a dry run, the code describes what *would* have happened.
 | Dry-run mode | ✅ Done |
 | Logging | ✅ Done |
 | Return a result object to the caller | ✅ Done |
-| Git discovery — find repositories automatically | Planned |
+| Git discovery — find repositories automatically | ✅ Done |
 | Backup summaries — copied files and storage used | ✅ Done |
 | Exclusion profiles for different environments | Planned |
 | Interactive project selection | Planned |

@@ -1,6 +1,11 @@
 # Backup-DevelopmentProject.ps1
-# Dot-source this file to load the Backup-DevelopmentProject function:
+# Dot-source this file to load its functions:
 #     . .\Backup-DevelopmentProject.ps1
+#
+# Main commands:
+#     Backup-DevelopmentProject   Back up one project folder.
+#     Find-GitRepository          List the Git repositories under a folder.
+#     Backup-GitRepository        Find every Git repository under a folder and back each one up.
 
 function Write-BackupLog {
     <#
@@ -99,6 +104,104 @@ function Format-ByteSize {
     return "$Bytes bytes"
 }
 
+function Get-DefaultLogDirectory {
+    <#
+    .SYNOPSIS
+        Returns the default log folder: %LOCALAPPDATA%\DevelopmentBackup\Logs
+    .DESCRIPTION
+        LOCALAPPDATA (usually C:\Users\<you>\AppData\Local) is where Windows
+        programs keep their own files for the current user. Keeping logs
+        there, rather than inside this project, means backing up this
+        project never copies its own log files along with it.
+    #>
+    return (Join-Path $env:LOCALAPPDATA "DevelopmentBackup\Logs")
+}
+
+function Get-FullPath {
+    <#
+    .SYNOPSIS
+        Turns a path such as ".\MyGame" into a full path like "C:\Projects\MyGame".
+    .DESCRIPTION
+        Uses PowerShell's current location (the folder shown in your prompt)
+        and works even if the path does not exist yet.
+    #>
+    param(
+        [string]$Path
+    )
+
+    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+}
+
+function Test-IsSameOrInside {
+    <#
+    .SYNOPSIS
+        Returns $true if -Path is the same folder as -Folder, or inside it.
+    #>
+    param(
+        [string]$Path,
+        [string]$Folder
+    )
+
+    # Ending both with "\" stops "C:\Projects2" from counting as inside
+    # "C:\Projects". Windows paths ignore upper/lower case, so the
+    # comparison does too.
+    $PathWithSlash   = $Path.TrimEnd('\') + '\'
+    $FolderWithSlash = $Folder.TrimEnd('\') + '\'
+    return $PathWithSlash.StartsWith($FolderWithSlash, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Find-GitRepository {
+    <#
+    .SYNOPSIS
+        Lists the Git repositories found under a folder.
+
+    .DESCRIPTION
+        A folder counts as a Git repository if it contains a ".git" entry.
+        Once a repository is found, the search does not look inside it:
+        backing up that repository already includes everything inside it.
+
+        Shortcut-like folders (symbolic links and junctions) are skipped,
+        because they can point back to a parent folder and loop forever.
+
+    .EXAMPLE
+        Find-GitRepository -Path "C:\Users\Me\source\repos"
+    #>
+    param(
+        # Folder to search.
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        # How many folder levels below -Path to search.
+        # 0 = only check -Path itself, 1 = its subfolders too, and so on.
+        [int]$MaxDepth = 4
+    )
+
+    # Is this folder itself a repository? (".git" is usually a folder, but
+    # can be a file for Git worktrees, so any kind of item counts.)
+    if (Test-Path -LiteralPath (Join-Path $Path ".git")) {
+        return (Get-FullPath $Path)
+    }
+
+    # Stop when we've gone deep enough.
+    if ($MaxDepth -le 0) {
+        return
+    }
+
+    # Otherwise, search each subfolder the same way. A function calling
+    # itself like this is called RECURSION; MaxDepth goes down by one each
+    # level, which guarantees it eventually stops.
+    # -Force includes hidden folders; -ErrorAction SilentlyContinue skips
+    # folders we don't have permission to open.
+    $Subfolders = Get-ChildItem -LiteralPath $Path -Directory -Force -ErrorAction SilentlyContinue
+
+    foreach ($Subfolder in $Subfolders) {
+        $IsLink = $Subfolder.Attributes -band [System.IO.FileAttributes]::ReparsePoint
+        if (-not $IsLink) {
+            Find-GitRepository -Path $Subfolder.FullName -MaxDepth ($MaxDepth - 1)
+        }
+    }
+}
+
 function Backup-DevelopmentProject {
     <#
     .SYNOPSIS
@@ -135,8 +238,8 @@ function Backup-DevelopmentProject {
         [switch]$DryRun,
 
         # Folder where a log file is written for every run.
-        # Defaults to a "Logs" folder next to this script.
-        [string]$LogDirectory = (Join-Path $PSScriptRoot "Logs")
+        # Defaults to %LOCALAPPDATA%\DevelopmentBackup\Logs.
+        [string]$LogDirectory = (Get-DefaultLogDirectory)
     )
 
     # ------------------------------------------------------------------
@@ -213,6 +316,15 @@ function Backup-DevelopmentProject {
     # Verify that the source directory exists.
     if (-not (Test-Path -LiteralPath $Source -PathType Container)) {
         $Result.Message = "Source directory does not exist."
+        Write-BackupLog -LogFile $LogFile -Color Red -Message "ERROR: $($Result.Message)"
+        $Result.Duration = (Get-Date) - $StartTime
+        return $Result
+    }
+
+    # Refuse to back up a folder into itself or into one of its own
+    # subfolders. Robocopy would then copy the backup into the backup.
+    if (Test-IsSameOrInside -Path (Get-FullPath $Destination) -Folder (Get-FullPath $Source)) {
+        $Result.Message = "Destination is the same as the source or inside it. Choose a destination outside the project."
         Write-BackupLog -LogFile $LogFile -Color Red -Message "ERROR: $($Result.Message)"
         $Result.Duration = (Get-Date) - $StartTime
         return $Result
@@ -374,4 +486,132 @@ function Backup-DevelopmentProject {
     }
 
     return $Result
+}
+
+function Backup-GitRepository {
+    <#
+    .SYNOPSIS
+        Finds every Git repository under a folder and backs up each one.
+
+    .DESCRIPTION
+        Searches -SearchPath for Git repositories (see Find-GitRepository) and
+        runs Backup-DevelopmentProject for each one. Every repository keeps
+        the same relative location under -DestinationRoot, for example:
+
+            C:\Users\Me\source\repos\Games\SpaceGame
+            ->  <DestinationRoot>\Games\SpaceGame
+
+        One repository failing does not stop the others.
+
+    .OUTPUTS
+        One result object per repository (the same kind that
+        Backup-DevelopmentProject returns).
+
+    .EXAMPLE
+        $Results = Backup-GitRepository -SearchPath "C:\Users\Me\source\repos" -DestinationRoot "C:\NordLocker\Development_Backups"
+    #>
+    param(
+        # Folder to search for Git repositories.
+        [Parameter(Mandatory = $true)]
+        [string]$SearchPath,
+
+        # Folder that receives one backup folder per repository.
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationRoot,
+
+        # How many folder levels below -SearchPath to search.
+        [int]$MaxDepth = 4,
+
+        # Preview every repository's backup without copying anything.
+        [switch]$DryRun,
+
+        # Folder where each repository's log file is written.
+        # Defaults to %LOCALAPPDATA%\DevelopmentBackup\Logs.
+        [string]$LogDirectory = (Get-DefaultLogDirectory)
+    )
+
+    if (-not (Test-Path -LiteralPath $SearchPath -PathType Container)) {
+        Write-Host "ERROR: Search folder does not exist: $SearchPath" -ForegroundColor Red
+        return
+    }
+
+    $FullSearchPath      = Get-FullPath $SearchPath
+    $FullDestinationRoot = Get-FullPath $DestinationRoot
+
+    Write-Host "`nSearching for Git repositories in $FullSearchPath ..." -ForegroundColor Cyan
+
+    # @( ) always produces an array, even when 0 or 1 repositories are found,
+    # so .Count and foreach behave the same in every case.
+    $Repositories = @(Find-GitRepository -Path $FullSearchPath -MaxDepth $MaxDepth)
+
+    # Leave out repositories that are inside the destination: those are
+    # earlier BACKUPS (they contain .git too). Backing them up again would
+    # create backups of backups.
+    $Repositories = @($Repositories | Where-Object {
+        -not (Test-IsSameOrInside -Path $_ -Folder $FullDestinationRoot)
+    })
+
+    if ($Repositories.Count -eq 0) {
+        Write-Host "No Git repositories found." -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "Found $($Repositories.Count) Git repository(s):"
+    foreach ($Repository in $Repositories) {
+        Write-Host "  $Repository"
+    }
+
+    # The part of each repository's path below the search folder, for
+    # example "Games\SpaceGame". Used for the backup location and the table.
+    $SearchPrefix = $FullSearchPath.TrimEnd('\')
+    function Get-RelativePath([string]$FullPath) {
+        $Relative = $FullPath.Substring($SearchPrefix.Length).TrimStart('\')
+        if (-not $Relative) {
+            # The search folder is itself a repository; use its own name.
+            $Relative = Split-Path -Path $FullPath -Leaf
+        }
+        return $Relative
+    }
+
+    # Back up each repository. "foreach" collects every result object that
+    # Backup-DevelopmentProject returns into $Results.
+    # -DryRun:$DryRun passes our switch along exactly as it was given.
+    $Results = foreach ($Repository in $Repositories) {
+        $Destination = Join-Path $FullDestinationRoot (Get-RelativePath $Repository)
+        Backup-DevelopmentProject -Source $Repository -Destination $Destination `
+            -DryRun:$DryRun -LogDirectory $LogDirectory
+    }
+    $Results = @($Results)
+
+    # ------------------------------------------------------------------
+    # Overview (console only)
+    # ------------------------------------------------------------------
+
+    # @{ Label = ...; Expression = { ... } } is a CALCULATED COLUMN: the
+    # table shows whatever the script block returns for each result ($_).
+    Write-Host "`n===== Git repository backup overview =====" -ForegroundColor Cyan
+    $Results | Format-Table -AutoSize `
+        @{ Label = "Repository";  Expression = { Get-RelativePath $_.Source } },
+        Success,
+        @{ Label = "Copied";      Expression = { if ($null -ne $_.FilesCopied) { "{0} ({1})" -f $_.FilesCopied, (Format-ByteSize $_.BytesCopied) } } },
+        FilesFailed,
+        @{ Label = "Backup size"; Expression = { if ($null -ne $_.BackupBytes) { Format-ByteSize $_.BackupBytes } } },
+        Message | Out-Host
+
+    # [long]$null is 0, so repositories without numbers simply add nothing.
+    $Succeeded   = @($Results | Where-Object { $_.Success }).Count
+    $FilesCopied = ($Results | ForEach-Object { [long]$_.FilesCopied } | Measure-Object -Sum).Sum
+    $BytesCopied = ($Results | ForEach-Object { [long]$_.BytesCopied } | Measure-Object -Sum).Sum
+    if ($DryRun) { $Verb = "would be copied" } else { $Verb = "copied" }
+
+    if ($Succeeded -eq $Results.Count) { $Color = "Green" } else { $Color = "Red" }
+    Write-Host ("{0} of {1} repository(s) succeeded. {2} file(s) {3} ({4})." -f `
+        $Succeeded, $Results.Count, $FilesCopied, $Verb, (Format-ByteSize $BytesCopied)) -ForegroundColor $Color
+
+    if (-not $DryRun) {
+        $BackupBytes = ($Results | ForEach-Object { [long]$_.BackupBytes } | Measure-Object -Sum).Sum
+        Write-Host ("Backups now use {0} in total." -f (Format-ByteSize $BackupBytes))
+    }
+
+    return $Results
 }
