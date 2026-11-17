@@ -6,6 +6,7 @@
 #     Backup-DevelopmentProject   Back up one project folder.
 #     Find-GitRepository          List the Git repositories under a folder.
 #     Backup-GitRepository        Find every Git repository under a folder and back each one up.
+#     Get-ExclusionProfile        List the exclusion profiles (VisualStudio, Unity, Unreal, ...).
 
 function Write-BackupLog {
     <#
@@ -102,6 +103,118 @@ function Format-ByteSize {
     if ($Bytes -ge 1MB) { return "{0:N2} MB" -f ($Bytes / 1MB) }
     if ($Bytes -ge 1KB) { return "{0:N1} KB" -f ($Bytes / 1KB) }
     return "$Bytes bytes"
+}
+
+function Get-ExclusionProfile {
+    <#
+    .SYNOPSIS
+        Lists the exclusion profiles, or returns the exclusions for one or more of them.
+
+    .DESCRIPTION
+        An exclusion profile is a named set of generated folders and files to
+        leave out of a backup, for one kind of development environment.
+
+        Each profile has three lists:
+          Directories      Folder names excluded at ANY depth (wildcards allowed).
+          RootDirectories  Folder names excluded only at the TOP of the project
+                           (no wildcards). Used for names like "Library" or
+                           "Logs" that could also be real folders deeper inside.
+          Files            File name patterns excluded anywhere.
+
+        Several profiles can be combined; their lists are merged.
+        To add or change a profile, edit $AllProfiles below.
+
+    .EXAMPLE
+        Get-ExclusionProfile
+        Lists every available profile.
+
+    .EXAMPLE
+        Get-ExclusionProfile -Name Unity, VisualStudio
+        Returns the merged exclusions of both profiles.
+    #>
+    param(
+        # Profile name(s). Leave out to list all profiles.
+        [string[]]$Name
+    )
+
+    # [ordered] keeps the profiles in the order they are written here.
+    $AllProfiles = [ordered]@{
+        VisualStudio = @{
+            Description     = "Visual Studio C++/C# build output (the original default)."
+            Directories     = @(".vs", "x64", "Debug", "Release", "bin", "obj")
+            RootDirectories = @()
+            Files           = @("*.user", "*.suo", "*.cache")
+        }
+        Unity = @{
+            Description     = "Unity projects: caches and builds Unity regenerates."
+            Directories     = @(".vs")
+            RootDirectories = @("Library", "Temp", "Obj", "Build", "Builds", "Logs",
+                                "UserSettings", "MemoryCaptures", "Recordings")
+            Files           = @("*.csproj", "*.sln", "*.suo", "*.user", "*.pidb",
+                                "*.booproj", "*.svd", "*.pdb", "*.mdb", "*.opendb", "*.VC.db")
+        }
+        Unreal = @{
+            Description     = "Unreal Engine projects: compiled binaries and caches."
+            Directories     = @(".vs", "Binaries", "Intermediate", "DerivedDataCache")
+            RootDirectories = @("Saved")
+            Files           = @("*.sln", "*.suo", "*.user", "*.VC.db", "*.opensdf", "*.sdf")
+        }
+        CMake = @{
+            Description     = "CMake projects: build folders (including CLion's and Visual Studio's)."
+            Directories     = @(".vs", "cmake-build-*")
+            RootDirectories = @("build", "out")
+            Files           = @()
+        }
+        Godot = @{
+            Description     = "Godot projects: the import cache Godot rebuilds."
+            Directories     = @()
+            RootDirectories = @(".godot", ".import")
+            Files           = @()
+        }
+    }
+
+    # No name given: show what's available.
+    if (-not $Name) {
+        foreach ($Key in $AllProfiles.Keys) {
+            [PSCustomObject]@{
+                Name            = $Key
+                Description     = $AllProfiles[$Key].Description
+                Directories     = $AllProfiles[$Key].Directories -join ", "
+                RootDirectories = $AllProfiles[$Key].RootDirectories -join ", "
+                Files           = $AllProfiles[$Key].Files -join ", "
+            }
+        }
+        return
+    }
+
+    $Directories     = @()
+    $RootDirectories = @()
+    $Files           = @()
+
+    foreach ($ProfileName in $Name) {
+        # .Contains on an [ordered] table ignores upper/lower case,
+        # so "unity" and "Unity" both work.
+        if (-not $AllProfiles.Contains($ProfileName)) {
+            throw "Unknown exclusion profile '$ProfileName'. Available profiles: $($AllProfiles.Keys -join ', ')."
+        }
+        $Directories     += $AllProfiles[$ProfileName].Directories
+        $RootDirectories += $AllProfiles[$ProfileName].RootDirectories
+        $Files           += $AllProfiles[$ProfileName].Files
+    }
+
+    # Top-level folders are passed to Robocopy as full paths, and Robocopy
+    # stops with a fatal error if a full path contains a wildcard.
+    $WildcardRoots = @($RootDirectories | Where-Object { $_ -match '[*?]' })
+    if ($WildcardRoots.Count -gt 0) {
+        throw "RootDirectories cannot contain wildcards (* or ?): $($WildcardRoots -join ', '). Move them to Directories instead."
+    }
+
+    return [PSCustomObject]@{
+        Name            = $Name -join ", "
+        Directories     = @($Directories | Select-Object -Unique)
+        RootDirectories = @($RootDirectories | Select-Object -Unique)
+        Files           = @($Files | Select-Object -Unique)
+    }
 }
 
 function Get-DefaultLogDirectory {
@@ -213,7 +326,7 @@ function Backup-DevelopmentProject {
         Every run (including dry runs) writes its own log file.
 
     .OUTPUTS
-        A PSCustomObject with Success, ExitCode, DryRun, a summary (FilesCopied,
+        A PSCustomObject with Success, ExitCode, DryRun, ExclusionProfile, a summary (FilesCopied,
         BytesCopied, FilesSkipped, FilesFailed, FilesExtra), the backup's size
         (BackupFiles, BackupBytes), Duration, Source, Destination, LogFile,
         and Message, so calling scripts can check what happened.
@@ -237,6 +350,10 @@ function Backup-DevelopmentProject {
         # Preview what would be copied without copying or creating anything.
         [switch]$DryRun,
 
+        # Which generated files to leave out. One or more profile names;
+        # run Get-ExclusionProfile to list them. Default: VisualStudio.
+        [string[]]$ExclusionProfile = @("VisualStudio"),
+
         # Folder where a log file is written for every run.
         # Defaults to %LOCALAPPDATA%\DevelopmentBackup\Logs.
         [string]$LogDirectory = (Get-DefaultLogDirectory)
@@ -255,6 +372,7 @@ function Backup-DevelopmentProject {
         Success      = $false
         ExitCode     = $null     # Robocopy's exit code; stays $null if Robocopy never ran.
         DryRun       = [bool]$DryRun
+        ExclusionProfile = $ExclusionProfile -join ", "
         FilesCopied  = $null     # Copied (or, in a dry run, would be copied).
         BytesCopied  = $null     # Size of those files.
         FilesSkipped = $null     # Not copied: unchanged, or excluded by a file pattern.
@@ -308,6 +426,7 @@ function Backup-DevelopmentProject {
     Write-BackupLog -LogFile $LogFile -LogOnly -Message "Mode:        $Mode"
     Write-BackupLog -LogFile $LogFile -LogOnly -Message "Source:      $Source"
     Write-BackupLog -LogFile $LogFile -LogOnly -Message "Destination: $Destination"
+    Write-BackupLog -LogFile $LogFile -LogOnly -Message "Exclusions:  $($ExclusionProfile -join ', ')"
 
     # ------------------------------------------------------------------
     # Backup
@@ -325,6 +444,18 @@ function Backup-DevelopmentProject {
     # subfolders. Robocopy would then copy the backup into the backup.
     if (Test-IsSameOrInside -Path (Get-FullPath $Destination) -Folder (Get-FullPath $Source)) {
         $Result.Message = "Destination is the same as the source or inside it. Choose a destination outside the project."
+        Write-BackupLog -LogFile $LogFile -Color Red -Message "ERROR: $($Result.Message)"
+        $Result.Duration = (Get-Date) - $StartTime
+        return $Result
+    }
+
+    # Look up the exclusion profile(s) before creating anything, so a
+    # misspelled profile name stops the run without touching the disk.
+    try {
+        $Exclusions = Get-ExclusionProfile -Name $ExclusionProfile
+    }
+    catch {
+        $Result.Message = $_.Exception.Message
         Write-BackupLog -LogFile $LogFile -Color Red -Message "ERROR: $($Result.Message)"
         $Result.Duration = (Get-Date) - $StartTime
         return $Result
@@ -353,22 +484,27 @@ function Backup-DevelopmentProject {
         }
     }
 
-    # Directories that should not be included.
-    $ExcludedDirectories = @(
-        ".vs",
-        "x64",
-        "Debug",
-        "Release",
-        "bin",
-        "obj"
-    )
+    # Build Robocopy's exclusion switches from the profile(s).
+    #   /XD <names>  excludes folders with these names at ANY depth.
+    #   /XD <full paths> excludes only those exact folders. That's how
+    #                top-level-only folders (RootDirectories) are handled:
+    #                "Library" becomes "C:\...\MyGame\Library".
+    #   /XF <patterns> excludes matching files anywhere.
+    # A switch is only added if it has something to exclude.
+    $FullSource = Get-FullPath $Source
+    $ExcludedDirectories = @($Exclusions.Directories) +
+        @($Exclusions.RootDirectories | ForEach-Object { Join-Path $FullSource $_ })
+    $ExcludedFiles = @($Exclusions.Files)
 
-    # Files that should not be included.
-    $ExcludedFiles = @(
-        "*.user",
-        "*.suo",
-        "*.cache"
-    )
+    $ExclusionOptions = @()
+    if ($ExcludedDirectories.Count -gt 0) {
+        $ExclusionOptions += "/XD"
+        $ExclusionOptions += $ExcludedDirectories
+    }
+    if ($ExcludedFiles.Count -gt 0) {
+        $ExclusionOptions += "/XF"
+        $ExclusionOptions += $ExcludedFiles
+    }
 
     # Extra Robocopy switches that only apply to some runs.
     # /L means "list only": Robocopy reports every file it WOULD copy,
@@ -391,7 +527,8 @@ function Backup-DevelopmentProject {
     }
 
     Write-Host "Source:      $Source"
-    Write-Host "Destination: $Destination`n"
+    Write-Host "Destination: $Destination"
+    Write-Host "Exclusions:  $($Exclusions.Name)`n"
 
     # Execute Robocopy.
     # /BYTES makes Robocopy print exact byte counts ("30910") instead of
@@ -403,8 +540,7 @@ function Backup-DevelopmentProject {
     # every line Robocopy prints would become part of this function's OUTPUT,
     # and a caller would receive dozens of text lines mixed in with $Result.
     robocopy $Source $Destination /E `
-        /XD $ExcludedDirectories `
-        /XF $ExcludedFiles `
+        $ExclusionOptions `
         /R:2 `
         /W:2 `
         /BYTES `
@@ -525,6 +661,10 @@ function Backup-GitRepository {
         # Preview every repository's backup without copying anything.
         [switch]$DryRun,
 
+        # Exclusion profile(s) used for every repository found.
+        # Run Get-ExclusionProfile to list them. Default: VisualStudio.
+        [string[]]$ExclusionProfile = @("VisualStudio"),
+
         # Folder where each repository's log file is written.
         # Defaults to %LOCALAPPDATA%\DevelopmentBackup\Logs.
         [string]$LogDirectory = (Get-DefaultLogDirectory)
@@ -532,6 +672,16 @@ function Backup-GitRepository {
 
     if (-not (Test-Path -LiteralPath $SearchPath -PathType Container)) {
         Write-Host "ERROR: Search folder does not exist: $SearchPath" -ForegroundColor Red
+        return
+    }
+
+    # Check the profile name(s) once, up front, instead of failing the
+    # same way for every repository.
+    try {
+        Get-ExclusionProfile -Name $ExclusionProfile | Out-Null
+    }
+    catch {
+        Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
         return
     }
 
@@ -579,7 +729,7 @@ function Backup-GitRepository {
     $Results = foreach ($Repository in $Repositories) {
         $Destination = Join-Path $FullDestinationRoot (Get-RelativePath $Repository)
         Backup-DevelopmentProject -Source $Repository -Destination $Destination `
-            -DryRun:$DryRun -LogDirectory $LogDirectory
+            -DryRun:$DryRun -ExclusionProfile $ExclusionProfile -LogDirectory $LogDirectory
     }
     $Results = @($Results)
 

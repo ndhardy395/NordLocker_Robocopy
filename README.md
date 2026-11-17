@@ -15,6 +15,7 @@ NordLocker does not read `.gitignore`, so this script decides what to leave out 
 - **Returns a result object** — scripts can check `.Success` instead of reading console text.
 - **Backup summaries** — files copied, skipped, and failed, how much data was copied, and how much storage the backup uses.
 - **Git discovery** — point it at a folder such as `source\repos` and it finds and backs up every Git repository inside, with an overview table at the end.
+- **Exclusion profiles** — built-in exclusion lists for Visual Studio, Unity, Unreal, CMake, and Godot projects, which can be combined.
 
 ## Requirements
 
@@ -107,6 +108,7 @@ Get-Help Backup-GitRepository -Full
 | `-Source` | Yes | The project folder to back up. Must already exist. |
 | `-Destination` | Yes | Where the backup goes. Created automatically if it doesn't exist (except during a dry run). |
 | `-DryRun` | No | Lists what would be copied without copying, overwriting, or creating anything. Uses Robocopy's `/L` (list only) switch. |
+| `-ExclusionProfile` | No | Which generated files to leave out: `VisualStudio` (default), `Unity`, `Unreal`, `CMake`, `Godot`, or several separated by commas. See [What gets excluded](#what-gets-excluded-exclusion-profiles). |
 | `-LogDirectory` | No | Folder for log files. Defaults to `%LOCALAPPDATA%\DevelopmentBackup\Logs` (see [Logs](#logs)). |
 
 ### Result object
@@ -118,6 +120,7 @@ Every run returns one object. If you don't save it in a variable, PowerShell pri
 | `Success` | `$true` if the run worked (Robocopy exit code 0–7), otherwise `$false`. |
 | `ExitCode` | Robocopy's exit code. Empty if Robocopy never ran (for example, the source was missing). |
 | `DryRun` | `$true` if this was a dry run. |
+| `ExclusionProfile` | The exclusion profile(s) used. |
 | `FilesCopied` | Files copied (in a dry run: files that *would* be copied). |
 | `BytesCopied` | Size of those files, in bytes. |
 | `FilesSkipped` | Files not copied because they were unchanged, **or** excluded by a file pattern (`*.user`, `*.suo`, `*.cache`). Files inside excluded folders aren't counted at all. |
@@ -184,6 +187,7 @@ Backups now use 251.8 KB in total.
 | `-DestinationRoot` | Yes | Folder that receives one backup folder per repository. |
 | `-MaxDepth` | No | How many folder levels below `-SearchPath` to search. Default: `4`. |
 | `-DryRun` | No | Preview every repository without copying anything. |
+| `-ExclusionProfile` | No | Exclusion profile(s) for every repository found. Default: `VisualStudio`. |
 | `-LogDirectory` | No | Where each repository's log file goes. Defaults to `%LOCALAPPDATA%\DevelopmentBackup\Logs`. |
 
 How repositories are found:
@@ -195,16 +199,46 @@ How repositories are found:
 - Folders without `.git` are **not** backed up. Use `Backup-DevelopmentProject` for those.
 - One repository failing doesn't stop the others.
 
-## What gets excluded
+## What gets excluded (exclusion profiles)
 
-| Type | Excluded |
-|---|---|
-| Folders | `.vs`, `x64`, `Debug`, `Release`, `bin`, `obj` |
-| Files | `*.user`, `*.suo`, `*.cache` |
+What's left out depends on the **exclusion profile**: a named set of generated folders and files for one kind of development environment. The default is `VisualStudio`, which is the same list this script has always used.
 
-Folder exclusions match by **name at any depth**. For example, both `Debug\` and `src\Debug\` are skipped. A *file* called `Debug.md` is still copied, because folder exclusions only apply to folders.
+| Profile | Folders excluded at any depth | Folders excluded only at the top of the project | Files excluded |
+|---|---|---|---|
+| `VisualStudio` *(default)* | `.vs`, `x64`, `Debug`, `Release`, `bin`, `obj` | — | `*.user`, `*.suo`, `*.cache` |
+| `Unity` | `.vs` | `Library`, `Temp`, `Obj`, `Build`, `Builds`, `Logs`, `UserSettings`, `MemoryCaptures`, `Recordings` | `*.csproj`, `*.sln`, `*.suo`, `*.user`, `*.pidb`, `*.booproj`, `*.svd`, `*.pdb`, `*.mdb`, `*.opendb`, `*.VC.db` |
+| `Unreal` | `.vs`, `Binaries`, `Intermediate`, `DerivedDataCache` | `Saved` | `*.sln`, `*.suo`, `*.user`, `*.VC.db`, `*.opensdf`, `*.sdf` |
+| `CMake` | `.vs`, `cmake-build-*` | `build`, `out` | — |
+| `Godot` | — | `.godot`, `.import` | — |
 
-To change the lists, edit `$ExcludedDirectories` and `$ExcludedFiles` in the script.
+**Choose a profile with `-ExclusionProfile`:**
+
+```powershell
+Backup-DevelopmentProject -Source "C:\Projects\SpaceGame" -Destination "C:\NordLocker\Development_Backups\SpaceGame" -ExclusionProfile Unity
+```
+
+**Combine profiles** by separating them with commas. Their lists are merged:
+
+```powershell
+Backup-DevelopmentProject -Source "C:\Projects\SpaceGame" -Destination "C:\NordLocker\Development_Backups\SpaceGame" -ExclusionProfile Unity, VisualStudio
+```
+
+**List the profiles** from PowerShell:
+
+```powershell
+Get-ExclusionProfile
+```
+
+How matching works:
+
+- **Any depth:** a folder with that name is skipped wherever it is. Both `Debug\` and `src\Debug\` are skipped. Wildcards such as `cmake-build-*` are allowed.
+- **Top of the project only:** only that exact folder is skipped. With `Unity`, the top-level `Logs\` is skipped but `Assets\Art\Logs\` is kept, because names like `Logs` and `Build` are also common for real content.
+- **Files:** matching files are skipped anywhere. A *file* called `Debug.md` is still copied, because folder exclusions only apply to folders.
+- `.git` is never excluded by any profile.
+- The `Unreal` profile skips the top-level `Saved` folder, which includes the editor's autosaves. If you want those kept, remove `Saved` from the profile.
+- A misspelled profile name stops the run before anything is created, and the error lists the valid names.
+
+To add or change a profile, edit `$AllProfiles` in the `Get-ExclusionProfile` function in the script.
 
 ## How backups behave
 
@@ -289,7 +323,7 @@ During a dry run, the code describes what *would* have happened.
 | Return a result object to the caller | ✅ Done |
 | Git discovery — find repositories automatically | ✅ Done |
 | Backup summaries — copied files and storage used | ✅ Done |
-| Exclusion profiles for different environments | Planned |
+| Exclusion profiles for different environments | ✅ Done |
 | Interactive project selection | Planned |
 | Integrity verification against the originals | Planned |
 | Multiple backup destinations | Planned |
