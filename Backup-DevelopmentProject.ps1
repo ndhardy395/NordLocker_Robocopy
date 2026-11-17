@@ -19,7 +19,10 @@ function Backup-DevelopmentProject {
 
         # Destination backup location.
         [Parameter(Mandatory = $true)]
-        [string]$Destination
+        [string]$Destination,
+
+        # Preview what would be copied without copying or creating anything.
+        [switch]$DryRun
     )
 
     # Verify that the source directory exists.
@@ -29,7 +32,8 @@ function Backup-DevelopmentProject {
     }
 
     # Create destination directory if necessary.
-    if (-not (Test-Path -LiteralPath $Destination)) {
+    # Skipped during a dry run so that a preview never changes the disk.
+    if (-not $DryRun -and -not (Test-Path -LiteralPath $Destination)) {
         New-Item -ItemType Directory -Path $Destination -Force | Out-Null
     }
 
@@ -50,7 +54,18 @@ function Backup-DevelopmentProject {
         "*.cache"
     )
 
-    Write-Host "`nStarting development backup..." -ForegroundColor Cyan
+    # Extra Robocopy switches that only apply to some runs.
+    # /L means "list only": Robocopy reports every file it WOULD copy,
+    # but copies, overwrites, and creates nothing.
+    # An empty array adds no arguments, so a normal run is unchanged.
+    $DryRunOptions = @()
+    if ($DryRun) {
+        $DryRunOptions = @("/L")
+        Write-Host "`nStarting development backup (DRY RUN - nothing will be copied)..." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "`nStarting development backup..." -ForegroundColor Cyan
+    }
 
     Write-Host "Source:      $Source"
     Write-Host "Destination: $Destination`n"
@@ -60,11 +75,18 @@ function Backup-DevelopmentProject {
         /XD $ExcludedDirectories `
         /XF $ExcludedFiles `
         /R:2 `
-        /W:2
+        /W:2 `
+        $DryRunOptions
 
     # Robocopy uses exit codes 0-7 for successful outcomes.
+    # During a dry run the exit code describes what WOULD have happened.
     if ($LASTEXITCODE -lt 8) {
-        Write-Host "`nBackup completed successfully!" -ForegroundColor Green
+        if ($DryRun) {
+            Write-Host "`nDry run completed. No files were copied." -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "`nBackup completed successfully!" -ForegroundColor Green
+        }
     }
     else {
         Write-Host "`nBackup encountered an error. Exit code: $LASTEXITCODE" -ForegroundColor Red
