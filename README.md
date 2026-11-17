@@ -107,7 +107,7 @@ Get-Help Backup-GitRepository -Full
 | `-Source` | Yes | The project folder to back up. Must already exist. |
 | `-Destination` | Yes | Where the backup goes. Created automatically if it doesn't exist (except during a dry run). |
 | `-DryRun` | No | Lists what would be copied without copying, overwriting, or creating anything. Uses Robocopy's `/L` (list only) switch. |
-| `-LogDirectory` | No | Folder for log files. Defaults to a `Logs` folder next to the script. |
+| `-LogDirectory` | No | Folder for log files. Defaults to `%LOCALAPPDATA%\DevelopmentBackup\Logs` (see [Logs](#logs)). |
 
 ### Result object
 
@@ -184,7 +184,7 @@ Backups now use 251.8 KB in total.
 | `-DestinationRoot` | Yes | Folder that receives one backup folder per repository. |
 | `-MaxDepth` | No | How many folder levels below `-SearchPath` to search. Default: `4`. |
 | `-DryRun` | No | Preview every repository without copying anything. |
-| `-LogDirectory` | No | Where each repository's log file goes. Defaults to `Logs` next to the script. |
+| `-LogDirectory` | No | Where each repository's log file goes. Defaults to `%LOCALAPPDATA%\DevelopmentBackup\Logs`. |
 
 How repositories are found:
 
@@ -217,12 +217,20 @@ This is an **incremental copy**, not a versioned backup:
 
 ## Logs
 
-Each run creates a log file named after the project folder and the start time:
+Each run creates a log file named after the project folder and the start time. By default, logs go to `%LOCALAPPDATA%\DevelopmentBackup\Logs`, which is usually `C:\Users\<you>\AppData\Local\DevelopmentBackup\Logs`:
 
 ```
-Logs\CalculatorApp_2026-11-17_16-16-43.log
-Logs\CalculatorApp_2026-11-17_16-16-57_DRYRUN.log
+CalculatorApp_2026-11-17_16-16-43.log
+CalculatorApp_2026-11-17_16-16-57_DRYRUN.log
 ```
+
+To open the folder:
+
+```powershell
+explorer "$env:LOCALAPPDATA\DevelopmentBackup\Logs"
+```
+
+The path of each run's log is also printed at the end of the run and stored in the result's `LogFile` property.
 
 A log contains:
 
@@ -242,11 +250,11 @@ The summary lines are also shown in the console.
 
 Notes:
 
-- Logs are never written into the source project or the backup.
+- Logs are never written into the source project or the backup, and the default location is outside this project too, so backing up this project never copies its own logs.
 - If the log can't be created, the script shows a warning and the backup still runs.
 - If two runs of the same project start in the same second, they share one log file.
 - Old logs are not deleted automatically.
-- The `Logs/` folder is excluded from Git by `.gitignore`.
+- If you point `-LogDirectory` at a `Logs` folder inside this project, `.gitignore` keeps it out of Git.
 
 ## Exit codes
 
@@ -270,7 +278,6 @@ During a dry run, the code describes what *would* have happened.
 - Old logs build up over time and need removing by hand.
 - The summary is read from Robocopy's English report. On a Windows installation where Robocopy reports in another language, the summary shows "not available" (the backup itself still works).
 - Measuring the backup's size means listing every file in it, which can take a while for very large backups.
-- The default `Logs` folder is inside this project. If you back up this project itself (for example with `Backup-GitRepository` on `source\repos`), its log files are copied too. Use `-LogDirectory` to keep logs elsewhere.
 - A Git *worktree* (a folder whose `.git` is a file, not a folder) is found and backed up, but its history lives in the main repository, so back that up as well.
 
 ## Roadmap
