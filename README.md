@@ -16,13 +16,16 @@ NordLocker does not read `.gitignore`, so this script decides what to leave out 
 - **Backup summaries** — files copied, skipped, and failed, how much data was copied, and how much storage the backup uses.
 - **Git discovery** — point it at a folder such as `source\repos` and it finds and backs up every Git repository inside, with an overview table at the end.
 - **Exclusion profiles** — built-in exclusion lists for Visual Studio, Unity, Unreal, CMake, and Godot projects, which can be combined.
+- **Git history that survives NordLocker** — each Git repository's full history is also saved as a single `.bundle` file, because NordLocker doesn't sync the `.git` folder (see [Git history and NordLocker](#git-history-and-nordlocker-bundles)).
 
 ## Requirements
 
 - Windows 10 or 11 (Robocopy is built in)
 - Windows PowerShell 5.1 or PowerShell 7+ (tested on both)
 
-No modules or other downloads are needed.
+- [Git for Windows](https://git-scm.com/) — used to create the history bundles for Git repositories
+
+No PowerShell modules are needed.
 
 ## Getting started
 
@@ -128,6 +131,7 @@ Every run returns one object. If you don't save it in a variable, PowerShell pri
 | `FilesExtra` | Files that exist only in the backup and were left alone. |
 | `BackupFiles` | Number of files in the backup folder after the run, including `.git`. Empty for dry runs. |
 | `BackupBytes` | Storage the backup folder uses after the run, in bytes. Empty for dry runs. |
+| `BundleFile` | Path of the Git history bundle created this run. Empty for dry runs, folders that aren't Git repositories, and repositories with no commits yet. |
 | `Duration` | How long the run took. |
 | `Source` | The source path that was used. |
 | `Destination` | The destination path that was used. |
@@ -171,12 +175,12 @@ C:\Users\<you>\source\repos\Tools\Calc        ->  C:\NordLocker\Development_Back
 At the end you get an overview table:
 
 ```
-Repository                 Success Copied        FilesFailed Backup size Message
-----------                 ------- ------        ----------- ----------- -------
-3D_Transformation_Pipeline    True 50 (139.6 KB)           0 139.6 KB    Backup completed successfully!
-DevelopmentBackup             True 67 (103.3 KB)           0 112.2 KB    Backup completed successfully!
-2 of 2 repository(s) succeeded. 117 file(s) copied (242.8 KB).
-Backups now use 251.8 KB in total.
+Repository                 Success Copied        FilesFailed Backup size Bundle Message
+----------                 ------- ------        ----------- ----------- ------ -------
+3D_Transformation_Pipeline    True 50 (139.6 KB)           0 175.4 KB    yes    Backup completed successfully!
+DevelopmentBackup             True 76 (155.1 KB)           0 176.7 KB    yes    Backup completed successfully!
+2 of 2 repository(s) succeeded. 126 file(s) copied (294.7 KB).
+Backups now use 352.1 KB in total.
 ```
 
 `$Results` holds one [result object](#result-object) per repository. Save the output in a variable as shown; otherwise PowerShell also prints every result object in full after the table.
@@ -198,6 +202,40 @@ How repositories are found:
 - Repositories inside `-DestinationRoot` are ignored, so earlier backups are never backed up again.
 - Folders without `.git` are **not** backed up. Use `Backup-DevelopmentProject` for those.
 - One repository failing doesn't stop the others.
+
+## Git history and NordLocker (bundles)
+
+**NordLocker does not sync files or folders whose names start with a dot.** That includes the `.git` folder, which holds a repository's entire history. This was confirmed by downloading a backup from the NordLocker website: the source files were there, but `.git` and `.gitignore` were missing. The copy in the local NordLocker folder still has them, but the cloud copy doesn't.
+
+So for every Git repository, the script also saves a **Git bundle**: one ordinary file containing every commit, branch, and tag.
+
+```
+Development_Backups\SpaceGame\
+    SpaceGame.bundle      <- full Git history, synced by NordLocker
+    .git\                 <- full history too, but only on this PC
+    Assets\ ...
+```
+
+**To restore a project from the cloud copy**, download its folder and run:
+
+```powershell
+git clone SpaceGame.bundle SpaceGame
+```
+
+That produces a complete repository with all branches, tags, and history, including `.gitignore` and any other committed dot-files. The clone's `origin` remote points at the bundle file. To point it back at GitHub:
+
+```powershell
+git remote set-url origin https://github.com/<you>/SpaceGame.git
+```
+
+Details:
+
+- The bundle is refreshed on every real backup and checked with `git bundle verify`. Dry runs don't create or change it.
+- Git builds the new bundle in a temporary file first, so a failed run never damages the previous bundle.
+- If the bundle can't be created, the run reports `Success = $false`. The files were still copied, but the history wouldn't reach the cloud.
+- A bundle holds **committed** work only. Uncommitted changes are backed up as normal files, unless their names start with a dot.
+- Folders that aren't Git repositories get no bundle. Repositories with no commits yet are skipped, because Git can't bundle an empty history.
+- The bundle exists only in the backup, so Robocopy sees it as a backup-only file. The script leaves it out of the "only in backup" count.
 
 ## What gets excluded (exclusion profiles)
 
@@ -313,6 +351,7 @@ During a dry run, the code describes what *would* have happened.
 - The summary is read from Robocopy's English report. On a Windows installation where Robocopy reports in another language, the summary shows "not available" (the backup itself still works).
 - Measuring the backup's size means listing every file in it, which can take a while for very large backups.
 - A Git *worktree* (a folder whose `.git` is a file, not a folder) is found and backed up, but its history lives in the main repository, so back that up as well.
+- NordLocker doesn't sync dot-named files and folders (`.git`, `.gitignore`, `.vscode`, `.editorconfig`, …). Committed ones come back from the Git bundle. **Uncommitted** dot-files and dot-files in projects that aren't Git repositories exist only in the local NordLocker folder, not in the cloud.
 
 ## Roadmap
 
@@ -325,6 +364,7 @@ During a dry run, the code describes what *would* have happened.
 | Backup summaries — copied files and storage used | ✅ Done |
 | Exclusion profiles for different environments | ✅ Done |
 | Interactive project selection | Planned |
+| Git history bundles (NordLocker doesn't sync `.git`) | ✅ Done |
 | Integrity verification against the originals | Planned |
 | Multiple backup destinations | Planned |
 

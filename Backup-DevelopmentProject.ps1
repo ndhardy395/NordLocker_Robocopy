@@ -328,8 +328,8 @@ function Backup-DevelopmentProject {
     .OUTPUTS
         A PSCustomObject with Success, ExitCode, DryRun, ExclusionProfile, a summary (FilesCopied,
         BytesCopied, FilesSkipped, FilesFailed, FilesExtra), the backup's size
-        (BackupFiles, BackupBytes), Duration, Source, Destination, LogFile,
-        and Message, so calling scripts can check what happened.
+        (BackupFiles, BackupBytes), BundleFile, Duration, Source, Destination,
+        LogFile, and Message, so calling scripts can check what happened.
 
     .NOTES
         Author: Mr. Hardy
@@ -380,6 +380,7 @@ function Backup-DevelopmentProject {
         FilesExtra   = $null     # Exist only in the backup (left alone).
         BackupFiles  = $null     # Files in the backup folder afterwards (not set for dry runs).
         BackupBytes  = $null     # Storage the backup folder uses afterwards (not set for dry runs).
+        BundleFile   = $null     # Git history bundle created this run (Git repositories only).
         Duration     = $null     # How long the run took.
         Source       = $Source
         Destination = $Destination
@@ -526,6 +527,12 @@ function Backup-DevelopmentProject {
         $LogOptions = @("/LOG+:$LogFile", "/TEE")
     }
 
+    # Where this project's Git bundle goes (see "Git bundle" below), and
+    # whether one is already there from an earlier run.
+    $IsGitRepository     = Test-Path -LiteralPath (Join-Path $Source ".git")
+    $BundlePath          = Join-Path $Destination "$ProjectName.bundle"
+    $BundleExistedBefore = Test-Path -LiteralPath $BundlePath
+
     Write-Host "Source:      $Source"
     Write-Host "Destination: $Destination"
     Write-Host "Exclusions:  $($Exclusions.Name)`n"
@@ -567,6 +574,13 @@ function Backup-DevelopmentProject {
         $Result.FilesFailed  = $Summary.Files.Failed
         $Result.FilesExtra   = $Summary.Files.Extras
 
+        # The bundle from an earlier run exists only in the backup, so
+        # Robocopy counts it as an "extra" file. It belongs there, so it is
+        # not counted, keeping "only in backup" about YOUR files.
+        if ($BundleExistedBefore -and $Result.FilesExtra -gt 0) {
+            $Result.FilesExtra--
+        }
+
         if ($DryRun) { $Verb = "would be copied" } else { $Verb = "copied" }
         $SummaryText = "Summary: {0} file(s) {1} ({2}), {3} skipped (unchanged or excluded by a file pattern), {4} failed, {5} only in backup." -f `
             $Result.FilesCopied, $Verb, (Format-ByteSize $Result.BytesCopied),
@@ -577,6 +591,64 @@ function Backup-DevelopmentProject {
         # Happens when Robocopy stops before printing its totals (a fatal
         # error), or if Windows shows Robocopy's report in another language.
         Write-BackupLog -LogFile $LogFile -Message "`nSummary: not available (Robocopy did not report totals)."
+    }
+
+    # ------------------------------------------------------------------
+    # Git bundle
+    # ------------------------------------------------------------------
+
+    # NordLocker does not sync files or folders whose names start with a
+    # dot, so the .git folder never reaches the cloud. A Git BUNDLE packs the
+    # repository's whole history (every commit, branch, and tag) into ONE
+    # ordinary file, which NordLocker does sync. To restore from it:
+    #     git clone <ProjectName>.bundle <FolderName>
+    # Only committed work is in a bundle; uncommitted changes are still
+    # backed up as normal files above.
+    $BundleProblem = $null
+    if ($IsGitRepository) {
+        if ($DryRun) {
+            Write-BackupLog -LogFile $LogFile -Message "Git bundle:  would be saved as $BundlePath"
+        }
+        elseif (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+            $BundleProblem = "Git is not installed, so the Git history bundle could not be created."
+        }
+        elseif (-not (Test-Path -LiteralPath $Destination -PathType Container)) {
+            $BundleProblem = "The destination folder does not exist, so the Git history bundle could not be created."
+        }
+        else {
+            # A repository with no commits yet has nothing to bundle.
+            $FirstRef = git -C $Source for-each-ref --count=1 --format="%(refname)"
+            if (-not $FirstRef) {
+                Write-BackupLog -LogFile $LogFile -Message "Git bundle:  skipped (the repository has no commits yet)."
+            }
+            else {
+                # --all includes every branch and tag. Git writes to a
+                # temporary "<name>.bundle.lock" file and only replaces the
+                # old bundle once the new one is complete, so a failure
+                # never damages the previous bundle.
+                # 2>&1 captures Git's messages so they can go into the log.
+                $BundleOutput = git -C $Source bundle create $BundlePath --all 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    $BundleProblem = "The Git history bundle could not be created: $(($BundleOutput | Select-Object -Last 1))"
+                }
+                else {
+                    # Check the new bundle is complete and readable.
+                    $VerifyOutput = git -C $Source bundle verify $BundlePath 2>&1
+                    if ($LASTEXITCODE -ne 0) {
+                        $BundleProblem = "The Git history bundle failed verification: $(($VerifyOutput | Select-Object -Last 1))"
+                    }
+                    else {
+                        $Result.BundleFile = $BundlePath
+                        $BundleSize = (Get-Item -LiteralPath $BundlePath).Length
+                        Write-BackupLog -LogFile $LogFile -Message ("Git bundle:  {0} ({1}, verified)" -f $BundlePath, (Format-ByteSize $BundleSize))
+                    }
+                }
+            }
+        }
+
+        if ($BundleProblem) {
+            Write-BackupLog -LogFile $LogFile -Color Red -Message "ERROR: $BundleProblem"
+        }
     }
 
     # Storage usage: measure the backup folder itself after a real run.
@@ -601,7 +673,17 @@ function Backup-DevelopmentProject {
 
     # Robocopy uses exit codes 0-7 for successful outcomes.
     # During a dry run the exit code describes what WOULD have happened.
-    if ($ExitCode -lt 8) {
+    # A missing Git bundle also counts as a failure: the files were copied,
+    # but the project's history would not reach the cloud.
+    if ($ExitCode -ge 8) {
+        $Result.Message = "Backup encountered an error. Exit code: $ExitCode"
+        Write-BackupLog -LogFile $LogFile -Color Red -Message "`n$($Result.Message)"
+    }
+    elseif ($BundleProblem) {
+        $Result.Message = "Files were copied, but the Git history was not saved. $BundleProblem"
+        Write-BackupLog -LogFile $LogFile -Color Red -Message "`n$($Result.Message)"
+    }
+    else {
         $Result.Success = $true
         if ($DryRun) {
             $Result.Message = "Dry run completed. No files were copied."
@@ -611,10 +693,6 @@ function Backup-DevelopmentProject {
             $Result.Message = "Backup completed successfully!"
             Write-BackupLog -LogFile $LogFile -Color Green -Message "`n$($Result.Message)"
         }
-    }
-    else {
-        $Result.Message = "Backup encountered an error. Exit code: $ExitCode"
-        Write-BackupLog -LogFile $LogFile -Color Red -Message "`n$($Result.Message)"
     }
 
     if ($LogFile) {
@@ -746,6 +824,7 @@ function Backup-GitRepository {
         @{ Label = "Copied";      Expression = { if ($null -ne $_.FilesCopied) { "{0} ({1})" -f $_.FilesCopied, (Format-ByteSize $_.BytesCopied) } } },
         FilesFailed,
         @{ Label = "Backup size"; Expression = { if ($null -ne $_.BackupBytes) { Format-ByteSize $_.BackupBytes } } },
+        @{ Label = "Bundle";      Expression = { if ($_.BundleFile) { "yes" } elseif (-not $_.DryRun -and -not $_.Success) { "NO" } else { "-" } } },
         Message | Out-Host
 
     # [long]$null is 0, so repositories without numbers simply add nothing.
